@@ -2,8 +2,8 @@
 
 A unified control plane for managing multiple coding-agent sessions, their Git worktrees, tickets, PRs, and QA environments.
 
-[!WARNING]
-This tool is usable but WIP. Tweaks, polish, and documentation are actively being applied over the next month. Not recommended for use until this warning is gone unless you are actively going to contribute back to the repo.
+> [!WARNING]
+> This tool is usable but WIP. Tweaks, polish, and documentation are actively being applied over the next month. Not recommended for use until this warning is gone unless you are actively going to contribute back to the repo.
 
 ## Installation
 
