@@ -1,0 +1,3 @@
+name: devmux
+entrypoint: bin/devmux
+setup: bin/setup.sh

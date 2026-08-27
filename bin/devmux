@@ -1,0 +1,258 @@
+#!/usr/bin/env ruby
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+
+require "json"
+require "shellwords"
+require "securerandom"
+require "fileutils"
+require "devmux/tmux"
+require "devmux/tmux_session"
+require "devmux/ui"
+require "devmux/plugins_menu"
+
+EXE = File.expand_path(__FILE__)
+
+def die(msg)
+  warn msg
+  exit 1
+end
+
+def registry
+  Devmux::Registry.new(File.join(Devmux::TmuxSession.state_dir, "agents.json"))
+end
+
+# Run the manager UI, but if it crashes, don't let the pane just vanish (which
+# looks like devmux "flashing and exiting"). Log the error, print it, and keep
+# the pane alive so it's readable when the client attaches.
+def run_ui
+  Devmux::UI.new(Devmux::TmuxBackend.new(EXE)).run
+rescue StandardError => e
+  Devmux::TmuxSession.log_error("ui", e)
+  warn "\ndevmux crashed (logged to #{Devmux::TmuxSession.log_path}):\n\n" \
+       "#{e.class}: #{e.message}\n#{e.backtrace.first(15).join("\n")}\n\n" \
+       "[press Enter to close]"
+  begin
+    $stdin.gets
+  rescue StandardError
+    sleep 300
+  end
+end
+
+# Print a session's context as JSON — each key with its value and a description
+# of what it's for, so an agent knows what to populate.
+def context_read(id)
+  ctx = registry.context(id)
+  die "no such session: #{id}" unless ctx
+  puts JSON.pretty_generate(Devmux::Context.annotate(ctx))
+end
+
+def context_write(id, key, values)
+  die "usage: devmux context write <session_id> <key> <value...>" if key.nil? || values.empty?
+  die "unknown context key: #{key}" unless Devmux::Context.key?(key)
+  value = Devmux::Context.coerce(key, values)
+  error = Devmux::Context.validate(key, value)
+  die error if error
+  record = registry.write_context(id, key, value)
+  die "no such session: #{id}" unless record
+  # Name/ticket changes should show in the pane title bar right away, if shown.
+  refresh_label(record) if %w[name tickets].include?(key)
+  # Echo the stored context back so success is visible and confirmed (not a
+  # silent no-op) — and read it fresh so we're reporting what actually persisted.
+  puts JSON.pretty_generate(Devmux::Context.annotate(registry.context(id)))
+rescue SystemExit
+  raise
+rescue StandardError => e
+  die "failed to write context: #{e.message}"
+end
+
+# Auto-maintain context from a hook payload (read as JSON on stdin). Fills in
+# what the agent can't reliably set itself — especially in a worktree-isolated
+# session, where the agent's own Bash calls to devmux are blocked by Claude's
+# worktree guard, but hooks (which run outside it) still work. Fire-and-forget:
+# never errors.
+#
+#   - name:     derived from the first prompt, only if not already named.
+#   - worktree: the session's cwd when it's a linked git worktree. Only ever
+#     *set* (when a linked worktree is detected) — never cleared, so it doesn't
+#     clobber a value set manually or by the agent when the hook's cwd happens to
+#     be the main repo (e.g. the agent pane opened there and hasn't cd'd in).
+def context_autosync(id)
+  record = registry.record(id)
+  return unless record
+  ctx = record["context"] || {}
+  payload = JSON.parse($stdin.read) rescue {}
+
+  if ctx["name"].to_s.empty?
+    prompt = payload["prompt"].to_s.strip
+    unless prompt.empty?
+      title = prompt.lines.first.to_s.strip
+      title = "#{title[0, 39].rstrip}…" if title.length > 40
+      registry.write_context(id, "name", title)
+    end
+  end
+
+  cwd = payload["cwd"].to_s
+  unless cwd.empty?
+    worktree = detect_worktree(cwd)
+    registry.write_context(id, "worktree", worktree) if worktree && ctx["worktree"] != worktree
+  end
+rescue StandardError
+  nil
+end
+
+# The linked-worktree root containing cwd, or nil if cwd is the main worktree /
+# not a repo. A linked worktree's toplevel has a `.git` *file* (pointer), whereas
+# the main repo has a `.git` *directory*.
+def detect_worktree(cwd)
+  top = `git -C #{cwd.shellescape} rev-parse --show-toplevel 2>/dev/null`.strip
+  return nil if top.empty?
+  File.file?(File.join(top, ".git")) ? top : nil
+end
+
+# Debug helpers for the plugin system. The poller normally runs on a background
+# thread inside the manager (`devmux ui`); these let you inspect it from a plain
+# shell.
+def plugins_list
+  Devmux::Plugins.all.each do |plugin|
+    on = Devmux::Plugins.enabled?(plugin.id) ? "on " : "off"
+    caps = []
+    caps << "provider" if plugin.respond_to?(:provider) && plugin.provider
+    caps << "poll" if plugin.respond_to?(:poll)
+    caps << "resource_details" if plugin.respond_to?(:resource_details)
+    puts "[#{on}] #{plugin.id.ljust(10)} #{plugin.name.ljust(12)} (#{caps.join(', ')})"
+  end
+end
+
+# Force one poll cycle now, in the foreground, echoing every plugin log line to
+# the terminal (and the plugin log). This actually creates sessions, so it
+# doubles as "sync my PRs right now."
+def plugins_poll
+  Devmux::Plugins.run_poll(registry, logger: lambda do |msg|
+    puts msg
+    Devmux::TmuxSession.log_plugin(msg)
+  end)
+end
+
+def open_resource(id)
+  url = Devmux::Plugins.resource_url(id)
+  die "no URL for #{id} (unknown scheme, or the plugin can't resolve it)" unless url
+  Devmux::TmuxSession.open_url(url)
+end
+
+# Agent-facing: ask devmux to show a file (optionally a line or a start-end
+# range) in a vim pane above this agent. Runs from the agent's sandboxed Bash,
+# which can't reach the tmux socket — so it just drops a request file that the
+# manager (which can drive tmux) picks up. The session is taken from
+# $DEVMUX_SESSION in the environment (no shell var in the command, so it clears
+# the worktree guard). The file is resolved to an absolute path here, in the
+# agent's cwd.
+def show_file(file, lines)
+  die "usage: devmux show <file> [line | start-end]" if file.nil?
+  session = ENV["DEVMUX_SESSION"].to_s
+  die "no $DEVMUX_SESSION in this pane" if session.empty?
+  start, finish = parse_line_spec(lines)
+  request = { "file" => File.expand_path(file), "start" => start, "end" => finish,
+              "token" => SecureRandom.hex(8) }
+  dir = Devmux::TmuxSession.state_dir
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, "show-#{session}.json"), JSON.generate(request))
+  puts "requested: #{request['file']}#{start ? " (lines #{start}-#{finish})" : ''}"
+end
+
+# "12" -> [12,12]; "12-20" -> [12,20]; nil/other -> [nil,nil] (open at top).
+def parse_line_spec(spec)
+  case spec.to_s
+  when /\A(\d+)-(\d+)\z/ then [Regexp.last_match(1).to_i, Regexp.last_match(2).to_i]
+  when /\A(\d+)\z/       then [Regexp.last_match(1).to_i, Regexp.last_match(1).to_i]
+  else [nil, nil]
+  end
+end
+
+def plugins_log
+  path = Devmux::TmuxSession.plugin_log_path
+  unless File.exist?(path)
+    puts "no plugin log yet at #{path}"
+    return
+  end
+  puts File.read(path)
+end
+
+def refresh_label(record)
+  tmux = Devmux::Tmux.new
+  return unless tmux.has_session?
+  pane = tmux.panes.find { |p| p[:agent] == record["name"] }
+  return unless pane
+  tmux.set_pane_option(pane[:id], Devmux::TmuxBackend::LABEL_OPTION,
+                       Devmux::TmuxSession.display_label(record))
+rescue StandardError
+  nil
+end
+
+# --status-bar shows tmux's status bar (hidden by default). Only takes effect
+# when starting a fresh session; ignored when attaching to a live one.
+status_bar = !ARGV.delete("--status-bar").nil?
+
+command = ARGV.shift
+
+case command
+when nil
+  # Bare `devmux`: become the app. If we're already inside our tmux session, run
+  # the UI; otherwise launch (or attach to) the hidden session.
+  die "tmux not found on PATH" unless Devmux::Tmux.available?
+  if Devmux::TmuxSession.inside_session?
+    run_ui
+  else
+    Devmux::TmuxSession.launch!(EXE, status_bar: status_bar)
+  end
+when "ui"
+  # Invoked as the session's manager pane.
+  die "devmux ui must run inside tmux" unless Devmux::TmuxSession.inside_session?
+  run_ui
+when "tmux-toggle"
+  # Invoked by the global Ctrl-Space keybind (a fresh process each time).
+  Devmux::TmuxSession.toggle!
+when "plugins-menu"
+  # Invoked inside a tmux popup by the manager's "p" key: the plugins on/off TUI.
+  Devmux::PluginsMenu.new.run
+when "open"
+  # Open a resource identifier's URL in the browser (used by click-to-open and
+  # available from a shell).
+  id = ARGV.shift
+  die "usage: devmux open <resource-id>" if id.nil?
+  open_resource(id)
+when "show"
+  # Agent-facing: show a file (+ optional lines) in a vim pane above this agent.
+  show_file(ARGV.shift, ARGV.shift)
+when "plugins"
+  # Debug/inspect the plugin system from a shell.
+  case ARGV.shift
+  when "list" then plugins_list
+  when "poll" then plugins_poll
+  when "log"  then plugins_log
+  else die "usage: devmux plugins list|poll|log"
+  end
+when "context"
+  # Read/write a session's context key/value pairs. Agents address themselves
+  # via $DEVMUX_SESSION (set in their pane); a session id may be a UUID or slug.
+  sub = ARGV.shift
+  id = ARGV.shift
+  die "usage: devmux context read|write <session_id> ..." if sub.nil? || id.nil?
+  case sub
+  when "read"     then context_read(id)
+  when "write"    then context_write(id, ARGV.shift, ARGV)
+  when "autosync" then context_autosync(id)
+  else die "usage: devmux context read|write <session_id> ..."
+  end
+else
+  warn "usage: devmux [--status-bar] [command]"
+  warn "  (no command)  launch devmux (hidden tmux session)"
+  warn "  --status-bar  show tmux's status bar (default: hidden)"
+  warn "  ui            run the control-plane UI (used inside the session)"
+  warn "  tmux-toggle   toggle the manager drawer (used by the Ctrl-Space bind)"
+  warn "  plugins-menu  the plugins on/off menu (used inside the manager's popup)"
+  warn "  plugins list|poll|log   inspect plugins / force a poll now / show the plugin log"
+  warn "  show <file> [line|start-end]   show a file in a vim pane above this agent"
+  warn "  context read <session_id>"
+  warn "  context write <session_id> <key> <value...>   keys: name, worktree, prs, tickets"
+  exit 1
+end
