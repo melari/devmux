@@ -159,7 +159,7 @@ module Devmux
     def agent_and_tree(agent)
       rows = [{ type: :agent, agent: agent }]
       if @expanded.include?(agent[:name])
-        (agent[:tickets] + agent[:prs]).each do |res|
+        resource_list(agent).each do |res|
           rows << { type: :resource, agent: agent, resource: res }
         end
       end
@@ -219,7 +219,7 @@ module Devmux
     # The resource id behind each association glyph, in render order (tickets then
     # PRs), so an icon index maps to the resource it belongs to.
     def resource_icon_ids(agent)
-      (agent[:tickets] + agent[:prs]).flat_map { |res| res[:icons].map { res[:id] } }
+      resource_list(agent).flat_map { |res| res[:icons].map { res[:id] } }
     end
 
     def move(delta)
@@ -298,7 +298,7 @@ module Devmux
     def open_pr
       a = selected_agent
       return unless a
-      pr = a[:prs].first
+      pr = a[:resources]["prs"].first
       return unless pr
       @backend.open_resource(pr[:id])
       @backend.focus_agent(a[:name])
@@ -316,7 +316,7 @@ module Devmux
     def open_ticket
       a = selected_agent
       return unless a
-      ticket = a[:tickets].first
+      ticket = a[:resources]["tickets"].first
       return unless ticket
       @backend.open_resource(ticket[:id])
       @backend.focus_agent(a[:name])
@@ -454,7 +454,13 @@ module Devmux
     end
 
     def resource_icons(agent)
-      (agent[:tickets] + agent[:prs]).flat_map { |res| res[:icons] }
+      resource_list(agent).flat_map { |res| res[:icons] }
+    end
+
+    # All resource views for an agent (tickets, prs, and any plugin keys like
+    # slack_threads) flattened in display order.
+    def resource_list(agent)
+      (agent[:resources] || {}).values.flatten
     end
 
     # A single association glyph, colored per mode: full color when :normal, the
@@ -680,7 +686,7 @@ module Devmux
     end
 
     def resource_annotations(agent)
-      (agent[:tickets] + agent[:prs]).map { |r| r[:annotation] }.compact
+      resource_list(agent).map { |r| r[:annotation] }.compact
     end
 
     # Wrap the selected row in a white background so the current item stands out
@@ -751,9 +757,9 @@ module Devmux
         end
         hints << "[a] archive" unless a[:archived]
         hints << "[v] vim" if a[:shown]
-        hints << "[p] PR" unless a[:prs].empty?
-        hints << "[t] ticket" unless a[:tickets].empty?
-        hints << "[⇥] tree" unless (a[:tickets] + a[:prs]).empty?
+        hints << "[p] PR" unless a[:resources]["prs"].empty?
+        hints << "[t] ticket" unless a[:resources]["tickets"].empty?
+        hints << "[⇥] tree" unless resource_list(a).empty?
         hints << "[d] delete"
       else
         hints << "[↵] toggle"

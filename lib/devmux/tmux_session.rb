@@ -158,18 +158,25 @@ module Devmux
       return "" unless Icons.nerd?
       ctx = record["context"] || {}
       parts = []
-      collect_title_icons(ctx["tickets"], Icons.ticket, parts)
-      collect_title_icons(ctx["prs"], Icons.pr, parts)
+      resource_icon_keys.each { |key, base_glyph| collect_title_icons(ctx[key], base_glyph, parts) }
       parts.empty? ? "" : "#{parts.join(' ')} "
+    end
+
+    # The identifier context keys that render as resource icons, in display order
+    # (tickets, prs, then any plugin-defined ones like slack_threads), each paired
+    # with its base glyph — nil for plugin keys, which supply a glyph via their
+    # resource_details.
+    def resource_icon_keys
+      fixed = { "tickets" => Icons.ticket, "prs" => Icons.pr }
+      ordered = fixed.keys + (Context.identifier_keys - fixed.keys)
+      ordered.map { |key| [key, fixed[key]] }
     end
 
     def collect_title_icons(value, base_glyph, parts)
       Array(value).select { |id| Providers.valid?(id) }.each do |id|
         details = Plugins.resource_details(id)
-        if base_glyph
-          glyph = (details && details[:glyph]) || base_glyph
-          parts << styled_title_icon(glyph, details && details[:color])
-        end
+        glyph = (details && details[:glyph]) || base_glyph
+        parts << styled_title_icon(glyph, details && details[:color]) if glyph
         Array(details && details[:icons]).each { |i| parts << styled_title_icon(i[:glyph], i[:color]) }
         # Annotation (e.g. a queued PR's ETA) beside the resource's icons.
         parts << "#[fg=colour130]#{details[:annotation]}" if details && details[:annotation]
@@ -712,8 +719,7 @@ module Devmux
         bound = !bind["uuid"].to_s.empty? && a["uuid"] == bind["uuid"]
         { name: a["name"], display: TmuxSession.display_label(a),
           display_plain: TmuxSession.display_label(a, brackets: false), state: agent_state(a),
-          tickets: resource_views(ctx["tickets"], Icons.ticket),
-          prs: resource_views(ctx["prs"], Icons.pr),
+          resources: resource_map(ctx),
           shown: shown.key?(a["name"]), archived: !!a["archived"],
           has_worktree: !ctx["worktree"].to_s.empty?,
           bound: bound, bind_status: (bound ? (bind["status"] || "pending") : nil) }
@@ -1253,16 +1259,25 @@ module Devmux
     # (nil = default); a plugin may append extra decoration icons (e.g. github's
     # CI pass/fail glyph). Toggling a plugin makes its icons appear/disappear, and
     # its polled state recolors/decorates them — all without touching context.
+    # One view per identifier context key: { key => [{id, icons, label, annotation}] }
+    # for every identifier key (tickets, prs, and plugin ones like slack_threads),
+    # in display order.
+    def resource_map(ctx)
+      TmuxSession.resource_icon_keys.each_with_object({}) do |(key, base_glyph), map|
+        map[key] = resource_views(ctx[key], base_glyph)
+      end
+    end
+
     def resource_views(value, base_glyph)
       Array(value).select { |id| Providers.valid?(id) }.map do |id|
         details = Plugins.resource_details(id)
         icons = []
-        if base_glyph
+        if Icons.nerd?
           glyph = (details && details[:glyph]) || base_glyph
-          icons << { glyph: glyph, color: details && details[:color] }
-        end
-        Array(details && details[:icons]).each do |icon|
-          icons << { glyph: icon[:glyph], color: icon[:color] }
+          icons << { glyph: glyph, color: details && details[:color] } if glyph
+          Array(details && details[:icons]).each do |icon|
+            icons << { glyph: icon[:glyph], color: icon[:color] }
+          end
         end
         { id: id, icons: icons, label: resource_label(id, details),
           annotation: details && details[:annotation] }

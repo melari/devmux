@@ -3,6 +3,7 @@ require "fileutils"
 require "devmux/plugin_host"
 require "devmux/plugins/github"
 require "devmux/plugins/linear"
+require "devmux/plugins/slack"
 
 module Devmux
   # The devmux plugin registry: the set of loaded plugins plus which of them are
@@ -29,7 +30,7 @@ module Devmux
   # tmux popup) from the manager UI and the `devmux context` CLI, and all must
   # see each other's writes.
   module Plugins
-    BUILTIN = [Github.new, Linear.new].freeze
+    BUILTIN = [Github.new, Linear.new, Slack.new].freeze
 
     module_function
 
@@ -64,6 +65,13 @@ module Devmux
     # Example identifier strings for a context key, across enabled plugins.
     def examples_for(key)
       enabled.select { |p| p.respond_to?(:examples_for) }.flat_map { |p| p.examples_for(key) }
+    end
+
+    # Context keys contributed by enabled plugins (merged into Context's schema),
+    # e.g. slack's `slack_threads`. { key => spec } like Context::KEYS entries.
+    def context_keys
+      enabled.select { |p| p.respond_to?(:context_keys) }
+             .reduce({}) { |acc, p| acc.merge(p.context_keys) }
     end
 
     # The enabled plugin owning an identifier's scheme, or nil. (Splits the

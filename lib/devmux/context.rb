@@ -37,22 +37,35 @@ module Devmux
 
     module_function
 
+    # The full schema: the built-in keys plus any contributed by enabled plugins
+    # (e.g. slack's `slack_threads`). Computed fresh so enabling/disabling a
+    # plugin adds/removes its keys.
+    def keys
+      KEYS.merge(Plugins.context_keys)
+    end
+
+    # Identifier keys (tickets, prs, and any plugin ones like slack_threads) — the
+    # ones holding scheme-prefixed ids that render as resource icons.
+    def identifier_keys
+      keys.select { |_key, spec| spec[:identifier] }.keys
+    end
+
     def key?(key)
-      KEYS.key?(key)
+      keys.key?(key)
     end
 
     def array?(key)
-      spec = KEYS[key]
+      spec = keys[key]
       !!(spec && spec[:array])
     end
 
     # Stored context merged over the schema defaults, so every allowed key is
     # present. `record` is the registry record, used for the `name` fallback.
-    # Extra (e.g. future plugin) keys already stored are preserved.
+    # Extra (e.g. disabled-plugin) keys already stored are preserved.
     def with_defaults(stored, record)
       stored ||= {}
       merged = {}
-      KEYS.each do |key, spec|
+      keys.each do |key, spec|
         merged[key] =
           if stored.key?(key)
             stored[key]
@@ -80,7 +93,7 @@ module Devmux
     end
 
     def description(key)
-      spec = KEYS[key]
+      spec = keys[key]
       spec && spec[:description]
     end
 
@@ -93,7 +106,7 @@ module Devmux
     # Validate a value for a key; returns an error string, or nil if OK.
     # Identifier keys (tickets, prs) require well-formed scheme-prefixed ids.
     def validate(key, value)
-      spec = KEYS[key]
+      spec = keys[key]
       return nil unless spec && spec[:identifier]
       bad = Array(value).reject { |v| Providers.valid?(v) }
       return nil if bad.empty?
