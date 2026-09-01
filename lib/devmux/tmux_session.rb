@@ -7,6 +7,8 @@ require "devmux/tmux"
 require "devmux/registry"
 require "devmux/plugins"
 require "devmux/plugin_host"
+require "devmux/projects"
+require "devmux/groups"
 require "devmux/icons"
 
 module Devmux
@@ -239,8 +241,11 @@ module Devmux
         create_session(tmux, exe_path, config)
       end
       # Record where devmux was launched from so new agents open here, even when
-      # reattaching to a session first created in a different directory.
+      # reattaching to a session first created in a different directory. Also seed
+      # the default project on first run (only when unset), so the first launch
+      # dir becomes the durable default the N picker offers.
       tmux.set_option(LAUNCH_DIR_OPTION, Dir.pwd)
+      Projects.set_default(Dir.pwd) unless Projects.default
       attach
     end
 
@@ -521,6 +526,34 @@ module Devmux
       "#{command}; exec $SHELL"
     end
 
+    # The pane command for a raw console (the `c` key): an interactive login-ish
+    # shell in the agent's working directory. We `cd` then `exec` the shell so the
+    # pane starts in the right place and closes when you type `exit`, like the
+    # vim/diff panes close on quit.
+    def console_launch_command(cwd)
+      shell = ENV["SHELL"].to_s
+      shell = "/bin/sh" if shell.empty?
+      cwd.to_s.empty? ? shell : "cd #{cwd.shellescape} && exec #{shell}"
+    end
+
+    # The pane command for showing a diff: diffnav in watch mode, which runs
+    # `diff_command` itself (git/gh) and periodically re-runs it to refresh. No
+    # shell fallback — when you press `q`, diffnav exits and the pane closes, the
+    # same way the vim "show" pane does. `watch_interval` (e.g. "30s") throttles
+    # the re-runs; used for the gh PR mode so it isn't hitting the API constantly.
+    # $DEVMUX_DIFF_PAGER can override the binary (must be diffnav-compatible).
+    def diff_launch_command(diff_command, watch_interval: nil)
+      pager = ENV["DEVMUX_DIFF_PAGER"].to_s
+      pager = "diffnav" if pager.empty?
+      argv = [pager, "--watch", "--watch-cmd", diff_command]
+      argv += ["--watch-interval", watch_interval] if watch_interval
+      # delta (which diffnav wraps) only paints its 24-bit add/delete backgrounds
+      # when it detects truecolor, and it keys off COLORTERM — which tmux doesn't
+      # set in the pane, so the green "add" background collapses to black. Force it
+      # on for this pane (sh runs the command, so a VAR=val prefix works).
+      "COLORTERM=truecolor #{Shellwords.join(argv)}"
+    end
+
     # Private config on a private socket: hide the status bar, keep our pane
     # titles from being overwritten by the agent shells, and bind the global
     # keys (no prefix, so they fire even while an agent pane is focused).
@@ -539,6 +572,14 @@ module Devmux
         set -g detach-on-destroy on
         setw -g automatic-rename off
         set -g allow-rename off
+
+        # True-color (24-bit RGB). Apps inside tmux see this TERM; advertising RGB
+        # as a terminal feature tells tmux the outer terminal can render 24-bit
+        # color, so it passes RGB escapes through instead of quantizing them — which
+        # otherwise makes delta/diffnav's dark-green/-red diff backgrounds collapse
+        # to black. The wildcard covers whatever the outer TERM is.
+        set -g default-terminal "tmux-256color"
+        set -as terminal-features ',*:RGB'
 
         # Deliver focus in/out events to pane apps, so e.g. nvim can dim itself
         # when its pane loses focus (tmux's own dim-inactive can't reach an app's
@@ -669,6 +710,11 @@ module Devmux
     # Pane user-option marking a pane as an agent's "show" vim pane, valued with
     # the agent's name, so we keep one vim pane per agent and can find it.
     VIM_OPTION = "@devmux_vim".freeze
+    # Same idea for an agent's "diff" pane (the `d` key): one per agent, marked
+    # with the agent's name.
+    DIFF_OPTION = "@devmux_diff".freeze
+    # And for an agent's "console" pane (the `c` key): a raw shell, one per agent.
+    CONSOLE_OPTION = "@devmux_console".freeze
 
     # How often (seconds) the bind enforcer reconciles the main repo with the
     # bound session's worktree. Under the 3s the feature promises.
@@ -714,22 +760,69 @@ module Devmux
     def agents
       shown = shown_panes
       bind = bind_state
+      group_ids = Groups.ids
       @registry.agents.map do |a|
         ctx = a["context"] || {}
         bound = !bind["uuid"].to_s.empty? && a["uuid"] == bind["uuid"]
+        gid = a["group"].to_s
         { name: a["name"], display: TmuxSession.display_label(a),
           display_plain: TmuxSession.display_label(a, brackets: false), state: agent_state(a),
           resources: resource_map(ctx),
           shown: shown.key?(a["name"]), archived: !!a["archived"],
+          # Membership: the group id, or nil for the implicit unnamed group (also
+          # nil when the id points at a since-deleted group).
+          group: (group_ids.include?(gid) ? gid : nil),
           has_worktree: !ctx["worktree"].to_s.empty?,
           bound: bound, bind_status: (bound ? (bind["status"] || "pending") : nil) }
       end
     end
 
+    # The named groups (in display order) the sidebar buckets sessions into. The
+    # unnamed group is implicit (nil membership) and rendered headerless at the top.
+    def groups
+      Groups.all
+    end
+
+    # Reorder the session `name` one step (delta -1 up / +1 down) through the
+    # grouped order, crossing group boundaries at the edges (which reassigns its
+    # group). The group order handed to the registry includes the implicit unnamed
+    # group "" at the front.
+    def move_agent(name, delta)
+      @registry.move(name, delta, [""] + Groups.ids)
+    end
+
     # Create a brand-new agent (fresh Claude session) and drop into it — you make
     # a new agent to start working in it, so collapse the drawer and focus it.
-    def new_agent
-      show_pane(@registry.add, focus_new: true)
+    # `project` (optional) is the directory it runs in; nil uses the default.
+    def new_agent(project: nil)
+      show_pane(@registry.add(project: project), focus_new: true)
+    end
+
+    # Pick a project in a centered popup, then create a new agent there. The
+    # picker is its own process (it can't drive tmux), so it writes its choice to
+    # a handoff file that we read once the (blocking) popup closes; no file means
+    # the pick was cancelled. Stale handoffs are cleared first so a prior cancel
+    # can't leak into this one.
+    def new_agent_pick
+      bin = @exe || "devmux"
+      File.delete(Projects.picked_path) if File.exist?(Projects.picked_path)
+      @tmux.display_popup("#{bin.shellescape} project-picker",
+                          width: 64, height: 22, border: "heavy",
+                          border_style: "fg=colour208")
+      project = take_picked_project
+      new_agent(project: project) if project
+    rescue StandardError => e
+      TmuxSession.log_error("project-pick", e)
+    end
+
+    # Read (and remove) the project the picker chose, or nil if none/invalid.
+    def take_picked_project
+      path = Projects.picked_path
+      return nil unless File.exist?(path)
+      data = JSON.parse(File.read(path)) rescue nil
+      File.delete(path) rescue nil
+      dir = data && data["path"].to_s
+      dir if dir && !dir.empty? && File.directory?(dir)
     end
 
     # Enter on an agent row: hide the pane (kill it — Claude has saved the
@@ -742,6 +835,8 @@ module Devmux
       pane = shown_panes[name]
       if pane
         close_vim_pane(name)
+        close_diff_pane(name)
+        close_console_pane(name)
         hide_pane(pane)
       else
         # Showing an archived agent brings it back to the active list.
@@ -756,6 +851,8 @@ module Devmux
       pane = shown_panes[name]
       if pane
         close_vim_pane(name)
+        close_diff_pane(name)
+        close_console_pane(name)
         @tmux.close(pane)
         TmuxSession.rebalance_agents(@tmux)
       end
@@ -773,6 +870,8 @@ module Devmux
       pane = shown_panes[name]
       if pane
         close_vim_pane(name)
+        close_diff_pane(name)
+        close_console_pane(name)
         @tmux.close(pane)
         TmuxSession.rebalance_agents(@tmux)
       end
@@ -842,6 +941,120 @@ module Devmux
       @tmux.focus(vim)
     end
 
+    # Open (or focus) a raw console pane for the hovered session: a shell split
+    # above its agent like the vim/diff panes. One per agent — reused if already
+    # open. `target` picks the directory: :worktree (the session's worktree, the
+    # `c` key) or :main (that worktree's main repo, the `C` key). When the console
+    # already exists we `cd` it to the requested target (clearing the input line
+    # first) rather than respawning, so a running shell isn't killed. Focuses it.
+    # No-op if the agent isn't shown.
+    def open_console(name, target: :worktree)
+      agent_pane = shown_panes[name]
+      return unless agent_pane
+      dir = console_dir(name, agent_pane, target)
+      console = console_pane_for(name)
+      if console
+        switch_console_dir(console, dir) unless dir.empty?
+      else
+        console = @tmux.split_above(agent_pane, TmuxSession.console_launch_command(dir))
+        @tmux.set_pane_option(console, CONSOLE_OPTION, name)
+      end
+      @tmux.focus(console)
+    end
+
+    # The directory a console should open in: the session's worktree (falling back
+    # to the agent pane's cwd) for :worktree; that worktree's main repo for :main.
+    def console_dir(name, agent_pane, target)
+      record = @registry.record(name)
+      worktree = ((record && record["context"]) || {})["worktree"].to_s
+      base = worktree.empty? ? @tmux.pane_current_path(agent_pane).to_s : worktree
+      return base unless target == :main
+      main_worktree(base) || base
+    end
+
+    # cd an existing console shell to `dir`: clear any half-typed input (Ctrl-u) so
+    # we don't append to it, then type the cd and run it.
+    def switch_console_dir(console, dir)
+      @tmux.send_keys(console, "C-u")
+      @tmux.send_text(console, "cd #{dir.shellescape}")
+      @tmux.send_keys(console, "Enter")
+    end
+
+    def console_pane_for(name)
+      pane = @tmux.panes.find { |p| p[:console] == name }
+      pane && pane[:id]
+    end
+
+    def close_console_pane(name)
+      pane = console_pane_for(name)
+      @tmux.close(pane) if pane
+    end
+
+    # Show a diff for the highlighted session in a pane above its agent (same
+    # split style as the vim "show" pane), rendered through diffnav in watch mode.
+    # Two modes:
+    #   - resource_id is a PR  -> `gh pr diff <n> -R owner/repo`
+    #   - otherwise            -> the worktree branch vs the repo's main branch,
+    #                             `git -C <worktree> diff <main>...HEAD`
+    # diffnav re-runs that command periodically to auto-refresh; the PR mode uses a
+    # longer interval so it isn't hammering the GitHub API. One diff pane per agent:
+    # any existing one is replaced so the diff is always current. Needs the agent
+    # shown (there must be a pane to split). Focuses the new pane — pressing `d` is
+    # a request to look at the diff — and closes on `q`, like the vim pane.
+    def show_diff(name, resource_id: nil)
+      agent_pane = shown_panes[name]
+      return unless agent_pane
+      pr = resource_id && pr_identifier?(resource_id)
+      command = pr ? pr_diff_command(resource_id) : worktree_diff_command(name, agent_pane)
+      return unless command
+      close_diff_pane(name)
+      launch = TmuxSession.diff_launch_command(command, watch_interval: (pr ? "30s" : nil))
+      id = @tmux.split_above(agent_pane, launch)
+      @tmux.set_pane_option(id, DIFF_OPTION, name)
+      @tmux.focus(id)
+    end
+
+    # True if an identifier is a GitHub PR id (github:owner/repo/pull/<n>).
+    def pr_identifier?(id)
+      id.to_s.match?(%r{\Agithub:[^/]+/[^/]+/pull/\d+\z})
+    end
+
+    # `gh pr diff` for a github PR id, scoped with -R so it works from any cwd.
+    def pr_diff_command(id)
+      _scheme, body = id.to_s.split(":", 2)
+      owner, repo, _kind, number = body.to_s.split("/")
+      return nil unless owner && repo && number
+      "gh pr diff #{number.shellescape} -R #{"#{owner}/#{repo}".shellescape}"
+    end
+
+    # A git diff for the session's worktree (falling back to the agent pane's cwd)
+    # against the repo's primary branch — the branch's whole diff INCLUDING
+    # uncommitted work. We diff from the merge-base to the working tree (`git diff
+    # <merge-base>`), not `<main>...HEAD`: the three-dot form only covers committed
+    # commits and omits staged/unstaged changes. The merge-base is resolved here
+    # (not left as a `$(...)` in the command) so it works whether or not diffnav
+    # runs the watch command through a shell. Falls back to the branch name if the
+    # merge-base can't be computed.
+    def worktree_diff_command(name, agent_pane)
+      record = @registry.record(name)
+      dir = ((record && record["context"]) || {})["worktree"].to_s
+      dir = @tmux.pane_current_path(agent_pane).to_s if dir.empty?
+      return nil if dir.empty?
+      branch = primary_branch(dir) || "main"
+      base = git(dir, "merge-base", branch, "HEAD") || branch
+      "git -C #{dir.shellescape} diff #{base.shellescape}"
+    end
+
+    def diff_pane_for(name)
+      pane = @tmux.panes.find { |p| p[:diff] == name }
+      pane && pane[:id]
+    end
+
+    def close_diff_pane(name)
+      pane = diff_pane_for(name)
+      @tmux.close(pane) if pane
+    end
+
     # Rename a session (set its context "name"); updates the pane title too.
     def rename(name, title)
       record = @registry.record(name)
@@ -872,17 +1085,14 @@ module Devmux
       TmuxSession.open_url(url) if url
     end
 
-    # Open the plugins menu in a centered popup. Runs `devmux plugins-menu` (its
-    # own process), which toggles the shared plugins store; nothing here needs to
-    # change since the sidebar doesn't render plugin state — the popup just needs
-    # to float over the window. Sized to the plugin count plus room for the title
-    # and hints.
-    def open_plugins
+    # Open the settings menu in a centered popup. Runs `devmux settings-menu` (its
+    # own process), whose Plugins/Groups categories mutate the shared plugin and
+    # group stores; the UI re-renders when it regains control after the popup
+    # closes (and via state_mtime for the group store). A heavy, orange border
+    # makes it feel like a proper dialog floating over the window.
+    def open_settings
       bin = @exe || "devmux"
-      # Large and generously padded, with the content centered inside (the menu
-      # centers on both axes). A heavy, orange border makes it feel like a proper
-      # dialog floating over the window.
-      @tmux.display_popup("#{bin.shellescape} plugins-menu",
+      @tmux.display_popup("#{bin.shellescape} settings-menu",
                           width: 64, height: 22, border: "heavy",
                           border_style: "fg=colour208")
     end
@@ -892,7 +1102,7 @@ module Devmux
     # whether that's an agent writing its own context (registry), a plugin poll
     # caching state (plugin store), or the bind enforcer flipping ok/broken.
     def state_mtime
-      files = [@state_file, @bind_file] +
+      files = [@state_file, @bind_file, File.join(TmuxSession.state_dir, "groups.json")] +
               Dir.glob(File.join(TmuxSession.state_dir, "plugin-*.json")) +
               Dir.glob(File.join(TmuxSession.state_dir, "show-*.json"))
       files.map { |f| File.mtime(f) rescue nil }.compact.max
@@ -1234,7 +1444,7 @@ module Devmux
       name = record["name"]
       env = { "DEVMUX_SESSION" => record["uuid"] }
       env["DEVMUX_BIN"] = @exe if @exe
-      id = @tmux.split_right(target: rightmost_pane, cwd: agent_cwd,
+      id = @tmux.split_right(target: rightmost_pane, cwd: agent_cwd(record),
                              command: TmuxSession.agent_command(record["uuid"], exe: @exe),
                              name: name, env: env)
       @tmux.set_pane_option(id, AGENT_OPTION, name)
@@ -1292,11 +1502,18 @@ module Devmux
       title.to_s.empty? ? short : "#{short} #{title}"
     end
 
-    # Where to open agent panes: the directory devmux was launched from (recorded
-    # as a session option in launch!), so agents run in *your* project — e.g.
-    # `cd ~/src/themis && ~/src/devmux/bin/devmux` opens agents in themis, not in
-    # devmux. Falls back to the manager pane's cwd, then Dir.pwd.
-    def agent_cwd
+    # Where to open an agent's pane, in precedence order:
+    #   1. the agent's own recorded project (chosen via the N picker),
+    #   2. the configured default project (seeded from the first launch dir),
+    #   3. the directory devmux was last launched from (session option), then
+    #      the manager pane's cwd, then Dir.pwd.
+    # So each agent runs in *its* repo, and the dir devmux itself was launched
+    # from no longer dictates where agents land.
+    def agent_cwd(record = nil)
+      project = record && record["project"].to_s
+      return project if project && !project.empty? && File.directory?(project)
+      default = Projects.default
+      return default if default && !default.empty? && File.directory?(default)
       dir = @tmux.get_option(TmuxSession::LAUNCH_DIR_OPTION)
       return dir if dir && !dir.empty? && File.directory?(dir)
       path = @manager_id && @tmux.pane_current_path(@manager_id)

@@ -41,6 +41,14 @@ module Devmux
     MOUSE_ON = "\e[?1000h\e[?1006h".freeze
     MOUSE_OFF = "\e[?1000l\e[?1006l".freeze
 
+    # Ask the terminal (via tmux, which has extended-keys on) to report modified
+    # special keys — notably Shift+Enter — using xterm modifyOtherKeys level 2,
+    # so we can tell Shift+Enter (expand/collapse all) from plain Enter (expand
+    # one). tmux may relay these as CSI-u instead; decode_csi handles both forms.
+    # Unmodified printable keys (j/k/space/…) are unaffected.
+    EXTKEYS_ON = "\e[>4;2m".freeze
+    EXTKEYS_OFF = "\e[>4m".freeze
+
     # Rows the centered hint block occupies at the top of the full view, so a
     # click's y maps to a list row (rows start on the line after it).
     HINT_HEIGHT = 4
@@ -61,6 +69,8 @@ module Devmux
       @published_hover = nil # sentinel so the first publish_hover always applies
       @expanded = Set.new   # session names shown as a resource tree
       @rename_buf = nil     # non-nil while the rename prompt is active
+      @hints_expanded = false # key hints hidden until toggled with "?"
+      @collapsed_groups = Set.new # group ids whose members are hidden
       refresh
     end
 
@@ -73,6 +83,7 @@ module Devmux
       # buffer to end-of-line, breaking the poll).
       IO.console.raw do
         $stdout.write(MOUSE_ON)
+        $stdout.write(EXTKEYS_ON)
         $stdout.flush
         refresh
         render
@@ -132,19 +143,36 @@ module Devmux
     # which must not shell out) and recompute the row layout.
     def refresh
       @agents = safe_agents
+      @groups = safe_groups
       @rows = build_rows(@agents)
       clamp_selection
     end
 
-    # Flatten agents into selectable rows: active agents (each optionally followed
-    # by its resource tree), then an "Archived (N)" header, then (when expanded)
-    # up to @reveal archived agents and a "show more" row for the remainder.
+    def safe_groups
+      @backend.groups
+    rescue StandardError
+      @groups || []
+    end
+
+    # Flatten agents into rows, bucketed by group: first the unnamed group (no
+    # header) at the top, then each named group — a blank spacer, a header, and
+    # its members — in group order (named groups show even when empty, so a
+    # session can be moved into one). Each active agent is optionally followed by
+    # its resource tree. Then the "Archived (N)" disclosure, as before.
     def build_rows(agents)
       active = agents.reject { |a| a[:archived] }
       archived = agents.select { |a| a[:archived] }.reverse
-      rows = active.flat_map { |a| agent_and_tree(a) }
+      rows = []
+      active.select { |a| a[:group].nil? }.each { |a| rows.concat(agent_and_tree(a)) }
+      (@groups || []).each do |group|
+        rows << { type: :spacer } unless rows.empty?
+        rows << { type: :group_header, group: group }
+        next if @collapsed_groups.include?(group[:id]) # collapsed: hide members
+        active.select { |a| a[:group] == group[:id] }.each { |a| rows.concat(agent_and_tree(a)) }
+      end
       return rows if archived.empty?
 
+      rows << { type: :spacer } unless rows.empty?
       rows << { type: :archive_header, count: archived.size }
       if @archive_expanded
         revealed = archived.first(@reveal)
@@ -156,11 +184,14 @@ module Devmux
     end
 
     # An agent row, plus a resource row per ticket/PR when its tree is expanded.
+    # Each resource row records whether it's the last child, so render_row can
+    # draw the right tree-branch connector (└─ for the last, ├─ otherwise).
     def agent_and_tree(agent)
       rows = [{ type: :agent, agent: agent }]
       if @expanded.include?(agent[:name])
-        resource_list(agent).each do |res|
-          rows << { type: :resource, agent: agent, resource: res }
+        list = resource_list(agent)
+        list.each_with_index do |res, i|
+          rows << { type: :resource, agent: agent, resource: res, last: i == list.size - 1 }
         end
       end
       rows
@@ -168,21 +199,34 @@ module Devmux
 
     def handle(key)
       return handle_mouse(key) if key.is_a?(Hash)
+      # Ctrl-u / Ctrl-d jump the cursor between groups. Matched by ordinal (21/4)
+      # so the source carries no literal control byte.
+      if key.is_a?(String) && key.bytesize == 1
+        return jump_group(-1) if key.ord == 21          # Ctrl-u
+        return jump_group(1) if key.ord == 4            # Ctrl-d
+        return delete_selected if [127, 8].include?(key.ord) # Backspace
+      end
       case key
-      when "j", :down then move(1)
-      when "k", :up   then move(-1)
-      when "\r", "\n" then activate
-      when "\t"       then toggle_tree_selected
-      when :backtab   then toggle_tree_all
+      when "j", :down    then move(1)
+      when "k", :up      then move(-1)
+      when "J"           then move_selected(1)
+      when "K"           then move_selected(-1)
+      when "\r", "\n"    then expand_collapse
+      when :shift_enter  then toggle_tree_all
+      when " "           then select_pane
       when "a"        then archive_selected
-      when "d"        then delete_selected
+      when "d"        then show_diff_selected
       when "n"        then @backend.new_agent
+      when "N"        then @backend.new_agent_pick
       when "b"        then bind_selected
       when "p"        then open_pr
       when "t"        then open_ticket
       when "v"        then open_editor_selected
+      when "c"        then open_console_selected(:worktree)
+      when "C"        then open_console_selected(:main)
       when "r"        then rename_selected
-      when "z"        then @backend.open_plugins
+      when "z"        then @backend.open_settings
+      when "?"        then @hints_expanded = !@hints_expanded
       when "q"        then @backend.detach
       end
     end
@@ -196,13 +240,14 @@ module Devmux
       return if cols <= COMPACT_MAX_COLS
       row_index = event[:y] - HINT_HEIGHT - 1
       return unless (0...@rows.size).cover?(row_index)
-      @sel = row_index
       row = @rows[row_index]
+      return unless selectable?(row) # ignore clicks on group headers / spacers
+      @sel = row_index
       if row[:type] == :agent
         id = clicked_resource_id(row[:agent], event[:x])
         id ? @backend.open_resource(id) : nil
       else
-        activate # archive header / show-more
+        expand_collapse # archive header / show-more
       end
     end
 
@@ -222,22 +267,95 @@ module Devmux
       resource_list(agent).flat_map { |res| res[:icons].map { res[:id] } }
     end
 
-    def move(delta)
-      return if @rows.empty?
-      @sel = (@sel + delta).clamp(0, @rows.size - 1)
+    # Row types the cursor can land on. Blank spacers are skipped over during
+    # navigation; group headers are selectable (Enter collapses/expands them).
+    SELECTABLE = %i[agent resource group_header archive_header more].freeze
+
+    def selectable?(row)
+      row && SELECTABLE.include?(row[:type])
     end
 
-    # Enter: toggle an agent's pane, open a resource (tree row), expand/collapse
-    # the archive section, or reveal more archived agents.
-    def activate
+    # Move the cursor to the next selectable row in `delta`'s direction, skipping
+    # headers/spacers. Stays put if there's none that way.
+    def move(delta)
+      return if @rows.empty?
+      i = @sel
+      loop do
+        i += delta
+        break if i.negative? || i >= @rows.size
+        if selectable?(@rows[i])
+          @sel = i
+          return
+        end
+      end
+    end
+
+    # Shift-J/Shift-K: move the highlighted session one step through the grouped
+    # order — swapping with its neighbour, or, at a group edge, crossing into the
+    # adjacent group (which changes its group). Keeps the cursor on the session.
+    def move_selected(delta)
+      agent = selected_agent
+      return unless agent
+      @backend.move_agent(agent[:name], delta)
+      refresh
+      idx = @rows.index { |r| r[:type] == :agent && r[:agent][:name] == agent[:name] }
+      @sel = idx if idx
+    end
+
+    # Ctrl-u / Ctrl-d: highlight the previous / next group. Anchors are the group
+    # headers, plus the top of the unnamed group (its first session) so you can
+    # jump back up into it. No-op past the first/last anchor.
+    def jump_group(dir)
+      anchors = group_anchors
+      return if anchors.empty?
+      cur = anchors.rindex { |i| i <= @sel }
+      target = (cur.nil? ? (dir.positive? ? 0 : -1) : cur + dir)
+      return if target.negative? || target >= anchors.size
+      @sel = anchors[target]
+    end
+
+    # Row indices the group jump stops on: the first session of the unnamed group
+    # (if any), then every group header.
+    def group_anchors
+      anchors = []
+      first_header = @rows.index { |r| r[:type] == :group_header }
+      scan_end = first_header || @rows.size
+      unnamed = (0...scan_end).find { |i| @rows[i][:type] == :agent }
+      anchors << unnamed if unnamed
+      @rows.each_with_index { |r, i| anchors << i if r[:type] == :group_header }
+      anchors
+    end
+
+    # Enter: expand/collapse the hovered session's resource tree, open a resource
+    # (tree row), expand/collapse the archive section, or reveal more archived
+    # agents. (Toggling a pane open/closed is now Space — see #select_pane.)
+    def expand_collapse
       row = @rows[@sel]
       return unless row
       case row[:type]
-      when :agent          then @backend.toggle(row[:agent][:name])
+      when :agent          then toggle_tree_selected
       when :resource       then open_resource_row(row)
+      when :group_header   then toggle_group_collapse(row)
       when :archive_header then toggle_archive_disclosure
       when :more           then @reveal += REVEAL_STEP
       end
+    end
+
+    # Enter on a group header: hide/show its member sessions. Keeps the cursor on
+    # the header.
+    def toggle_group_collapse(row)
+      id = row[:group][:id]
+      @collapsed_groups.include?(id) ? @collapsed_groups.delete(id) : @collapsed_groups.add(id)
+      refresh
+      idx = @rows.index { |r| r[:type] == :group_header && r[:group][:id] == id }
+      @sel = idx if idx
+    end
+
+    # Space: show/hide the hovered agent's pane (select/deselect it). Only agent
+    # rows have a pane to toggle.
+    def select_pane
+      a = selected_agent
+      @backend.toggle(a[:name]) if a
     end
 
     # Open a tree resource row's URL, then focus its agent pane (if open).
@@ -309,6 +427,27 @@ module Devmux
     def open_editor_selected
       name = selected_agent_name
       @backend.open_editor(name) if name
+    end
+
+    # Open (or focus) a raw console (shell) pane for the hovered session, split
+    # above its agent like the vim/diff panes. `target` is :worktree (c) or :main
+    # (C). Needs an open agent pane.
+    def open_console_selected(target)
+      name = selected_agent_name
+      @backend.open_console(name, target: target) if name
+    end
+
+    # Show a diff for the hovered row in a pane above its agent (through diffnav):
+    # a highlighted PR resource diffs that PR (gh); an agent (or non-PR resource)
+    # diffs its worktree branch vs the repo's main branch. The backend decides
+    # from the resource id.
+    def show_diff_selected
+      row = @rows[@sel]
+      return unless row
+      case row[:type]
+      when :resource then @backend.show_diff(row[:agent][:name], resource_id: row[:resource][:id])
+      when :agent    then @backend.show_diff(row[:agent][:name])
+      end
     end
 
     # Open the selected session's first associated ticket in the browser, then
@@ -498,8 +637,18 @@ module Devmux
       "\e[#{sgr}m#{Icons.agent}\e[0m"
     end
 
+    # Keep the cursor in range AND on a selectable row (never on a group header
+    # or spacer): snap to the nearest selectable row below, then above.
     def clamp_selection
-      @sel = @rows.empty? ? 0 : @sel.clamp(0, @rows.size - 1)
+      if @rows.empty?
+        @sel = 0
+        return
+      end
+      @sel = @sel.clamp(0, @rows.size - 1)
+      return if selectable?(@rows[@sel])
+      below = (@sel...@rows.size).find { |i| selectable?(@rows[i]) }
+      above = @sel.downto(0).find { |i| selectable?(@rows[i]) }
+      @sel = below || above || 0
     end
 
     def safe_agents
@@ -512,6 +661,13 @@ module Devmux
       IO.console.winsize[1]
     rescue StandardError
       (ENV["COLUMNS"] || 80).to_i
+    end
+
+    # Pane height in rows, used to pin the hint section to the bottom.
+    def rows
+      IO.console.winsize[0]
+    rescue StandardError
+      (ENV["LINES"] || 24).to_i
     end
 
     def safe_render
@@ -555,9 +711,25 @@ module Devmux
       active = @agents.reject { |a| a[:archived] }
       if active.empty?
         $stdout.write("(none)\r\n")
-      else
-        active.each { |a| $stdout.write(compact_row(a) + "\r\n") }
+        return
       end
+      written = compact_group(nil, active, false)
+      (@groups || []).each { |group| written = compact_group(group, active, written) }
+    end
+
+    # Render one group's compact rows (a truncated title line for a named group,
+    # then its members). Empty named groups are omitted in the narrow view.
+    # Returns whether anything has been written, so a blank spacer only goes
+    # between non-empty sections.
+    def compact_group(group, active, written)
+      members = active.select { |a| a[:group] == (group && group[:id]) }
+      return written if members.empty?
+      if group
+        $stdout.write("\r\n") if written
+        $stdout.write(truncate(group[:name].to_s, cols) + "\r\n")
+      end
+      members.each { |a| $stdout.write(compact_row(a) + "\r\n") }
+      true
     end
 
     # Minimized row: agent icon + ticket/PR icons + name (ticket ids, no
@@ -610,23 +782,62 @@ module Devmux
       else
         @rows.each_with_index { |row, i| $stdout.write(render_row(row, i == @sel)) }
       end
-      $stdout.write("\r\n")
-      if @rename_buf
-        $stdout.write(center("rename: #{@rename_buf}▏") + "\r\n")
-      elsif @confirm
-        $stdout.write(center("delete #{@confirm}? (y/n)") + "\r\n")
-      else
-        $stdout.write(footer)
+      draw_bottom
+    end
+
+    # The bottom section, pinned to the last rows of the pane via absolute cursor
+    # positioning (so it reads as a footer regardless of how long the list is): a
+    # modal prompt (rename/confirm) when one is active, otherwise the key-hints
+    # section (a single "[?] help" line collapsed, the full vertical list on a gray
+    # background when expanded). Any error is appended as the very last line.
+    def draw_bottom
+      block =
+        if @rename_buf
+          [center("rename: #{@rename_buf}▏")]
+        elsif @confirm
+          [center("delete #{@confirm}? (y/n)")]
+        else
+          hint_block
+        end
+      block += ["  \e[38;5;196m! #{@last_error}\e[0m"] if @last_error
+      return if block.empty?
+      start = [rows - block.size + 1, 1].max
+      $stdout.write("\e[#{start};1H")
+      block.each_with_index do |line, i|
+        $stdout.write(line)
+        $stdout.write("\r\n") unless i == block.size - 1
       end
-      $stdout.write("\r\n  \e[38;5;196m! #{@last_error}\e[0m\r\n") if @last_error
+    end
+
+    # The key-hints block: one dim "[?] help" line when collapsed, or the full
+    # list — one hint per line on a gray background — when expanded.
+    def hint_block
+      return ["\e[2;38;5;245m  [?] help\e[0m"] unless @hints_expanded
+      hint_items.map { |item| hint_bg_line("  #{item}") }
+    end
+
+    # A hint line filling the drawer width with a gray background, so the expanded
+    # section reads as a distinct panel. `text` must carry no inner color resets.
+    HINT_BG = "48;5;236".freeze
+    def hint_bg_line(text)
+      pad = [cols - text.length, 0].max
+      "\e[#{HINT_BG}m#{text}#{' ' * pad}\e[0m"
     end
 
     def render_row(row, selected)
-      # 2-column cursor (the Nerd selector glyph is wide): glyph+space when
-      # selected, two spaces otherwise, so rows stay aligned.
-      cursor = selected ? "#{Icons.selector} " : "  "
+      return "\r\n" if row[:type] == :spacer
       content =
         case row[:type]
+        when :group_header
+          # A named group's title (emoji allowed) in aqua, led by a progressive-
+          # disclosure arrow (▾ open / ▸ collapsed). Sits flush in the first column
+          # (sessions are indented) to set groups apart, and dims when collapsed.
+          # Unlike a session's resource tree, group members get no tree connectors.
+          g = row[:group]
+          collapsed = @collapsed_groups.include?(g[:id])
+          arrow = collapsed ? "▸" : "▾"
+          sgr = collapsed ? "2;38;5;39" : "1;38;5;39" # dim vs bold aqua
+          "\e[#{sgr}m#{arrow} #{truncate(g[:name].to_s, cols - 3)}\e[0m"
         when :agent
           a = row[:agent]
           # Archived agents render exactly like any other agent (state-colored
@@ -634,42 +845,61 @@ module Devmux
           # they take the not-shown path below like any other closed session. A
           # bound session just gets an aqua/red server icon appended. When the
           # tree is expanded, the inline association icons are dropped (assoc:
-          # false) since they show as their own rows below.
+          # false) since they show as their own rows below. A progressive-
+          # disclosure chevron leads the row (▸/▾, blank when no resources).
           assoc = !@expanded.include?(a[:name])
+          chev = chevron(a)
           label = truncate(label_of(a), label_budget(a))
           # Inline annotations (e.g. a queued PR's ETA) sit after the icons, only
           # in the collapsed form (when expanded they'd show in the tree rows).
           ann = assoc ? row_annotations(a) : ""
           base =
             if !a[:shown]
-              # Pane closed → checkbox/agent/name faint, but association icons keep
-              # their dimmed color. Built per-segment (not one outer faint wrap) so
-              # the colored glyphs' resets don't end the faint early.
-              "  #{faint_seg(cursor)}#{row_icons(a, mode: :dim, assoc: assoc)}#{ann}#{faint_seg(label)}"
+              # Pane closed → chevron/checkbox/agent/name faint, but association
+              # icons keep their dimmed color. Built per-segment (not one outer
+              # faint wrap) so the colored glyphs' resets don't end the faint early.
+              "  #{faint_seg(chev)}#{row_icons(a, mode: :dim, assoc: assoc)}#{ann}#{faint_seg(label)}"
             else
-              "  #{cursor}#{row_icons(a, assoc: assoc)}#{ann}#{label}"
+              "  #{chev}#{row_icons(a, assoc: assoc)}#{ann}#{label}"
             end
           base + bind_suffix(a)
         when :resource
-          resource_row(row[:resource], cursor)
+          resource_row(row)
         when :archive_header
+          # Also flush in the first column, like the group headers it sits among.
           caret = @archive_expanded ? "▾" : "▸"
-          muted("  #{cursor}#{caret} Archived (#{row[:count]})")
+          muted("#{caret} Archived (#{row[:count]})")
         when :more
-          muted("  #{cursor}  … show more (#{row[:remaining]})")
+          muted("     … show more (#{row[:remaining]})")
         end
       content = with_selection_bg(content) if selected
       "#{content}\r\n"
     end
 
-    # A resource (ticket/PR) row under an expanded session: indented, its icons
-    # in full color, then a truncated label (short id + title + any annotation
-    # like a queued PR's ETA). Enter opens it.
-    def resource_row(resource, cursor)
+    # Progressive-disclosure chevron for a session, in a fixed 2-cell slot so
+    # rows stay aligned: ▾ when its resource tree is expanded, ▸ when collapsed
+    # with resources to reveal, blank when it has none. Same glyphs as the
+    # Archived disclosure's caret.
+    def chevron(agent)
+      return "  " if resource_list(agent).empty?
+      @expanded.include?(agent[:name]) ? "▾ " : "▸ "
+    end
+
+    # A resource (ticket/PR) row under an expanded session: a tree-branch
+    # connector (└─ for the last child, ├─ otherwise) descending from the
+    # parent's chevron, its icons in full color, then a truncated label (short id
+    # + title + any annotation like a queued PR's ETA). Enter opens it.
+    def resource_row(row)
+      resource = row[:resource]
+      branch = row[:last] ? "└─" : "├─"
       glyphs = resource[:icons].map { |ic| styled_assoc(ic[:glyph], ic[:color], :normal) }.join(" ")
-      text = resource[:annotation] ? "#{resource[:label]} #{resource[:annotation]}" : resource[:label].to_s
-      budget = cols - 6 - (resource[:icons].size * 2) - 1
-      "    #{cursor}#{glyphs} #{truncate(text, budget)}"
+      # Annotation (e.g. a queued PR's ETA) sits right after the icons, before the
+      # label — not appended after it, where truncating a long title would clip it.
+      annotation = resource[:annotation].to_s
+      ann = annotation.empty? ? "" : "\e[38;5;130m#{annotation}\e[0m "
+      ann_cols = annotation.empty? ? 0 : annotation.length + 1
+      budget = cols - 5 - (resource[:icons].size * 2) - ann_cols - 1
+      "  \e[38;5;240m#{branch}\e[0m #{glyphs} #{ann}#{truncate(resource[:label].to_s, budget)}"
     end
 
     # Inline annotations for a row (e.g. queued PRs' ETAs), each in brown with a
@@ -736,53 +966,40 @@ module Devmux
       agent[:bound] && Icons.nerd? ? 2 : 0
     end
 
-    # Key hints, filtered to what the hovered row actually supports: [↵] means
-    # open on a resource row, show/hide on an agent; no [a] archive on an archived
-    # item; [b] reads "unbind" when bound, and is hidden on an archived item or
-    # one without a worktree; no [p] PR without a PR; [⇥] tree only when there are
-    # resources. Wrapped to fit the drawer width and centered.
-    def footer
+    # Key hints for the expanded section, one per line, filtered to what the
+    # hovered row actually supports (as the old footer did) but with the reorder /
+    # group-jump actions spelled out. [↵] is open on a resource row, tree/toggle
+    # on an agent; [b] reads "unbind" when bound and is hidden without a worktree;
+    # [p]/[t] only with a PR/ticket; the group-jump line only when groups exist.
+    def hint_items
       row = @rows[@sel]
-      hints = ["[j/k] move"]
+      items = ["[j/k] move", "[J/K] reorder session"]
+      items << "[^u/^d] jump between groups" unless (@groups || []).empty?
       case row && row[:type]
       when :resource
-        hints << "[↵] open"
+        items << "[↵] open" << "[d] diff"
+      when :group_header
+        items << (@collapsed_groups.include?(row[:group][:id]) ? "[↵] expand group" : "[↵] collapse group")
       when :agent
         a = row[:agent]
-        hints << "[↵] show/hide" << "[r] rename"
+        items << "[space] show/hide" << "[r] rename"
         if a[:bound]
-          hints << "[b] unbind"
+          items << "[b] unbind"
         elsif !a[:archived] && a[:has_worktree]
-          hints << "[b] bind"
+          items << "[b] bind"
         end
-        hints << "[a] archive" unless a[:archived]
-        hints << "[v] vim" if a[:shown]
-        hints << "[p] PR" unless a[:resources]["prs"].empty?
-        hints << "[t] ticket" unless a[:resources]["tickets"].empty?
-        hints << "[⇥] tree" unless resource_list(a).empty?
-        hints << "[d] delete"
+        items << "[a] archive" unless a[:archived]
+        items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
+        items << "[p] PR" unless a[:resources]["prs"].empty?
+        items << "[t] ticket" unless a[:resources]["tickets"].empty?
+        items << "[↵] tree" unless resource_list(a).empty?
+        items << "[d] diff" << "[⌫] delete"
       else
-        hints << "[↵] toggle"
+        items << "[↵] toggle"
       end
-      hints << "[n] new" << "[z] plugins" << "[q] quit"
-      wrap_hints(hints)
-    end
-
-    # Greedily pack hints into centered lines no wider than the drawer.
-    def wrap_hints(hints)
-      lines = []
-      current = ""
-      hints.each do |hint|
-        candidate = current.empty? ? hint : "#{current}   #{hint}"
-        if !current.empty? && candidate.length > cols
-          lines << current
-          current = hint
-        else
-          current = candidate
-        end
-      end
-      lines << current unless current.empty?
-      lines.map { |line| center(line) }.join("\r\n") + "\r\n"
+      items << "[n] new" << "[N] new in project" << "[z] settings"
+      items << "[?] hide help" << "[q] quit"
+      items
     end
 
     # Block until a keypress, then read it (used for the delete confirmation).
@@ -824,9 +1041,38 @@ module Devmux
       case seq
       when "A" then :up
       when "B" then :down
-      when "Z" then :backtab # Shift-Tab
+      when "Z" then :backtab # Shift-Tab (unbound; kept for completeness)
+      # Enter with modifiers. tmux relays extended keys as CSI-u (\e[13;<mod>u) or
+      # xterm modifyOtherKeys (\e[27;<mod>;13~); mod 1 (or absent) is plain Enter,
+      # anything higher means a modifier (Shift) is held → expand/collapse all.
+      when "13u", "13;1u", "27;1;13~" then "\r"
+      when /\A13;\d+u\z/, /\A27;\d+;13~\z/ then :shift_enter
       when /\A<(\d+);(\d+);(\d+)([Mm])\z/ # SGR mouse: <button;col;row;(M press|m release)
         { type: :mouse, button: $1.to_i, x: $2.to_i, y: $3.to_i, press: Regexp.last_match(4) == "M" }
+      # Modified keys under xterm modifyOtherKeys level 2 (we enable it for
+      # Shift+Enter): a Ctrl+letter arrives as CSI-u "<code>;<mod>u" or the
+      # "27;<mod>;<code>~" form instead of the raw control byte. Map Ctrl-u /
+      # Ctrl-d back to their bytes so #handle's ordinal check catches them (this is
+      # why Ctrl-u/Ctrl-d were being swallowed in the manager pane).
+      # Backspace can also arrive as CSI-u (\e[127u) under modifyOtherKeys; map it
+      # back to the DEL byte so #handle's ordinal check deletes.
+      when "127u", "127;1u", "8u", "8;1u" then [127].pack("C")
+      when /\A(\d+);(\d+)u\z/ then extended_key($1.to_i, $2.to_i)
+      when /\A27;(\d+);(\d+)~\z/ then extended_key($2.to_i, $1.to_i)
+      else "\e"
+      end
+    end
+
+    # Map a modifyOtherKeys code+modifier to a raw byte we handle, or "\e" if it's
+    # not one we care about. The modifier is xterm-encoded (1 + bitmask; Ctrl bit
+    # = 4), so Ctrl is held when (mod - 1) & 4 is set. Ctrl-u (code 117) and Ctrl-d
+    # (code 100) become bytes 0x15 / 0x04.
+    def extended_key(code, mod)
+      ctrl = ((mod - 1) & 4) != 0
+      return "\e" unless ctrl
+      case code
+      when 117 then [21].pack("C") # Ctrl-u
+      when 100 then [4].pack("C")  # Ctrl-d
       else "\e"
       end
     end
