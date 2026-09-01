@@ -21,6 +21,15 @@ ensure_tmux() {
   fi
 }
 
+ensure_diffnav() {
+  if command -v diffnav >/dev/null 2>&1; then
+    log "diffnav present"
+  else
+    log "installing diffnav via Homebrew (the diff viewer devmux's 'd' key uses)"
+    brew install diffnav
+  fi
+}
+
 ensure_rbenv() {
   if command -v rbenv >/dev/null 2>&1; then
     log "rbenv present"
@@ -43,6 +52,7 @@ ensure_ruby() {
 
 ensure_brew
 ensure_tmux
+ensure_diffnav
 ensure_rbenv
 ensure_ruby
 

@@ -14,7 +14,7 @@ module Devmux
     # format string (escaped so Ruby doesn't interpolate it). The trailing
     # @devmux_agent is our own pane user-option — a stable identity that the
     # program in the pane can't overwrite the way it can the title.
-    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}".freeze
+    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}\t\#{@devmux_diff}\t\#{@devmux_console}".freeze
 
     def self.available?
       system("tmux", "-V", out: File::NULL, err: File::NULL)
@@ -44,10 +44,12 @@ module Devmux
     # @devmux_agent user-option (nil when unset, e.g. the manager pane).
     def panes
       capture("list-panes", "-t", @session, "-F", PANE_FMT).each_line.map do |line|
-        id, title, width, left, active, agent, vim = line.chomp.split("\t", -1)
+        id, title, width, left, active, agent, vim, diff, console = line.chomp.split("\t", -1)
         { id: id, title: title, width: width.to_i, left: left.to_i,
           active: active == "1", agent: (agent.nil? || agent.empty? ? nil : agent),
-          vim: (vim.nil? || vim.empty? ? nil : vim) }
+          vim: (vim.nil? || vim.empty? ? nil : vim),
+          diff: (diff.nil? || diff.empty? ? nil : diff),
+          console: (console.nil? || console.empty? ? nil : console) }
       end.sort_by { |p| p[:left] }
     end
 
@@ -82,10 +84,13 @@ module Devmux
     end
 
     # Split `target` vertically, placing the new pane to its right; returns the
-    # new pane's id. tmux focuses the new pane by default. `env` sets pane
-    # environment variables (-e KEY=VAL).
+    # new pane's id. `-f` makes the new pane span the FULL window height rather
+    # than just the target's cell, so a new agent is a full-height column on the
+    # right even when the target agent has a stacked vim/diff/console pane above it
+    # (otherwise the new agent would land below that stack). tmux focuses the new
+    # pane by default. `env` sets pane environment variables (-e KEY=VAL).
     def split_right(target:, cwd:, command:, name:, env: {})
-      args = ["split-window", "-h", "-t", target, "-c", cwd, "-P", "-F", "\#{pane_id}"]
+      args = ["split-window", "-h", "-f", "-t", target, "-c", cwd, "-P", "-F", "\#{pane_id}"]
       env.each { |key, value| args += ["-e", "#{key}=#{value}"] }
       args << command
       id = capture(*args).strip

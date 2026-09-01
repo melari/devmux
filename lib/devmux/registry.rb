@@ -44,14 +44,53 @@ module Devmux
       @mutex.synchronize { by_id(load, id) }
     end
 
-    def add
+    # `project` (optional) is the directory the agent runs in — its pane's cwd.
+    # Stored on the record so it survives hide/show and restarts; nil means "use
+    # the default project" (see TmuxBackend#agent_cwd).
+    def add(project: nil)
       @mutex.synchronize do
         data = load
         rec = { "name" => next_name(data), "uuid" => SecureRandom.uuid,
                 "archived" => false, "context" => {} }
+        rec["project"] = project unless project.to_s.empty?
         data << rec
         save(data)
         rec
+      end
+    end
+
+    # Reorder an active session by one step (delta -1 up / +1 down) through the
+    # grouped sidebar order. `group_ids` is the full group order INCLUDING the
+    # implicit unnamed group "" at the front. Within a group it swaps with its
+    # neighbour; at a group's edge it crosses into the adjacent group (becoming
+    # that group's first/last member) — which is how a session changes group.
+    # No-op at the very top/bottom. All position math happens here under the mutex.
+    def move(name, delta, group_ids)
+      @mutex.synchronize do
+        data = load
+        rec = by_name(data, name)
+        next if rec.nil? || rec["archived"]
+        active = data.reject { |a| a["archived"] }
+        cur = group_of(rec, group_ids)
+        peers = active.select { |a| group_of(a, group_ids) == cur }
+        idx = peers.index(rec)
+        if delta.positive?
+          idx < peers.size - 1 ? swap_positions(data, rec, peers[idx + 1]) : cross_group(data, rec, cur, group_ids, +1)
+        else
+          idx.positive? ? swap_positions(data, rec, peers[idx - 1]) : cross_group(data, rec, cur, group_ids, -1)
+        end
+        save(data)
+      end
+    end
+
+    # Set (or clear, when blank) a session's group id.
+    def set_group(name, group_id)
+      @mutex.synchronize do
+        data = load
+        rec = by_name(data, name)
+        next unless rec
+        group_id.to_s.empty? ? rec.delete("group") : rec["group"] = group_id
+        save(data)
       end
     end
 
@@ -96,6 +135,46 @@ module Devmux
     end
 
     private
+
+    # A record's group id, normalized to "" (unnamed) when unset or pointing at a
+    # group that no longer exists.
+    def group_of(rec, group_ids)
+      gid = rec["group"].to_s
+      group_ids.include?(gid) ? gid : ""
+    end
+
+    # Swap two records' positions in the array (they share a group, so this just
+    # flips their relative order).
+    def swap_positions(data, first, second)
+      i = data.index(first)
+      j = data.index(second)
+      data[i], data[j] = data[j], data[i] if i && j
+    end
+
+    # Move `rec` into the adjacent group (dir +1 down / -1 up), reassigning its
+    # group and repositioning it so it renders first (moving down) or last (moving
+    # up) of that group. No-op past the first/last group.
+    def cross_group(data, rec, cur, group_ids, dir)
+      ci = group_ids.index(cur)
+      ti = ci && ci + dir
+      return if ti.nil? || ti.negative? || ti >= group_ids.size
+      target = group_ids[ti]
+      target.empty? ? rec.delete("group") : rec["group"] = target
+      data.delete(rec)
+      if dir.positive?
+        at = data.index { |a| group_of(a, group_ids) == target }
+        at ? data.insert(at, rec) : data.push(rec)
+      else
+        last = last_index(data) { |a| group_of(a, group_ids) == target }
+        last ? data.insert(last + 1, rec) : data.push(rec)
+      end
+    end
+
+    def last_index(data)
+      found = nil
+      data.each_with_index { |a, i| found = i if yield(a) }
+      found
+    end
 
     def by_name(data, name)
       data.find { |a| a["name"] == name }

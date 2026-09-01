@@ -9,6 +9,8 @@ require "devmux/tmux"
 require "devmux/tmux_session"
 require "devmux/ui"
 require "devmux/plugins_menu"
+require "devmux/settings_menu"
+require "devmux/project_picker"
 
 EXE = File.expand_path(__FILE__)
 
@@ -212,8 +214,17 @@ when "tmux-toggle"
   # Invoked by the global Ctrl-Space keybind (a fresh process each time).
   Devmux::TmuxSession.toggle!
 when "plugins-menu"
-  # Invoked inside a tmux popup by the manager's "p" key: the plugins on/off TUI.
+  # The plugins on/off TUI (kept standalone for debugging; the manager now opens
+  # the settings menu, which includes plugins as a category).
   Devmux::PluginsMenu.new.run
+when "settings-menu"
+  # Invoked inside a tmux popup by the manager's "z" key: the settings TUI
+  # (Plugins + Groups categories).
+  Devmux::SettingsMenu.new.run
+when "project-picker"
+  # Invoked inside a tmux popup by the manager's "N" key: pick a project for a
+  # new agent. Writes its choice to the handoff file the manager reads back.
+  Devmux::ProjectPicker.new.run
 when "open"
   # Open a resource identifier's URL in the browser (used by click-to-open and
   # available from a shell).
@@ -249,7 +260,8 @@ else
   warn "  --status-bar  show tmux's status bar (default: hidden)"
   warn "  ui            run the control-plane UI (used inside the session)"
   warn "  tmux-toggle   toggle the manager drawer (used by the Ctrl-Space bind)"
-  warn "  plugins-menu  the plugins on/off menu (used inside the manager's popup)"
+  warn "  settings-menu   the settings menu: plugins + groups (used inside the manager's popup)"
+  warn "  project-picker  pick a project for a new agent (used inside the manager's popup)"
   warn "  plugins list|poll|log   inspect plugins / force a poll now / show the plugin log"
   warn "  show <file> [line|start-end]   show a file in a vim pane above this agent"
   warn "  context read <session_id>"
