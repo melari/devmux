@@ -71,6 +71,7 @@ module Devmux
       @rename_buf = nil     # non-nil while the rename prompt is active
       @hints_expanded = false # key hints hidden until toggled with "?"
       @collapsed_groups = Set.new # group ids whose members are hidden
+      @flash = nil          # transient footer message (e.g. "copied!")
       refresh
     end
 
@@ -116,6 +117,7 @@ module Devmux
             select_on_expand if became_focused
             update_highlight(focused)
             publish_hover
+            expire_flash
             @mtime = @backend.state_mtime
           rescue StandardError => e
             # Keep the manager alive on a transient error, but surface it (log
@@ -189,9 +191,15 @@ module Devmux
     def agent_and_tree(agent)
       rows = [{ type: :agent, agent: agent }]
       if @expanded.include?(agent[:name])
-        list = resource_list(agent)
-        list.each_with_index do |res, i|
-          rows << { type: :resource, agent: agent, resource: res, last: i == list.size - 1 }
+        children = []
+        # First child: the worktree's branch name (fetched lazily, only for the
+        # expanded session). Enter on it copies the branch to the clipboard.
+        branch = @backend.worktree_branch(agent[:name])
+        children << { type: :branch, agent: agent, branch: branch } if branch && !branch.empty?
+        resource_list(agent).each { |res| children << { type: :resource, agent: agent, resource: res } }
+        children.each_with_index do |row, i|
+          row[:last] = (i == children.size - 1)
+          rows << row
         end
       end
       rows
@@ -269,7 +277,7 @@ module Devmux
 
     # Row types the cursor can land on. Blank spacers are skipped over during
     # navigation; group headers are selectable (Enter collapses/expands them).
-    SELECTABLE = %i[agent resource group_header archive_header more].freeze
+    SELECTABLE = %i[agent branch resource group_header archive_header more].freeze
 
     def selectable?(row)
       row && SELECTABLE.include?(row[:type])
@@ -334,6 +342,7 @@ module Devmux
       return unless row
       case row[:type]
       when :agent          then toggle_tree_selected
+      when :branch         then copy_branch(row)
       when :resource       then open_resource_row(row)
       when :group_header   then toggle_group_collapse(row)
       when :archive_header then toggle_archive_disclosure
@@ -356,6 +365,33 @@ module Devmux
     def select_pane
       a = selected_agent
       @backend.toggle(a[:name]) if a
+    end
+
+    # Enter on the worktree branch row: copy the branch name to the clipboard and
+    # flash a brief confirmation in the footer.
+    def copy_branch(row)
+      branch = row[:branch].to_s
+      return if branch.empty?
+      TmuxSession.copy_to_clipboard(branch) ? flash("copied!") : flash("copy failed")
+    end
+
+    # Show a brief message in the bottom section for ~1.2s (the run loop clears it).
+    def flash(message)
+      @flash = message
+      @flash_until = Time.now + 1.2
+      render
+    end
+
+    def flash_active?
+      @flash && @flash_until && Time.now < @flash_until
+    end
+
+    # Clear an expired flash and repaint, so the "copied!" message disappears on
+    # its own (checked each poll tick, ~0.2s granularity).
+    def expire_flash
+      return unless @flash && !flash_active?
+      @flash = nil
+      render
     end
 
     # Open a tree resource row's URL, then focus its agent pane (if open).
@@ -390,7 +426,7 @@ module Devmux
     # a resource row.
     def selected_agent_name
       row = @rows[@sel]
-      row && %i[agent resource].include?(row[:type]) ? row[:agent][:name] : nil
+      row && %i[agent branch resource].include?(row[:type]) ? row[:agent][:name] : nil
     end
 
     def toggle_archive_disclosure
@@ -792,7 +828,9 @@ module Devmux
     # background when expanded). Any error is appended as the very last line.
     def draw_bottom
       block =
-        if @rename_buf
+        if flash_active?
+          ["\e[1;38;5;40m#{center(@flash)}\e[0m"] # brief confirmation, e.g. "copied!"
+        elsif @rename_buf
           [center("rename: #{@rename_buf}▏")]
         elsif @confirm
           [center("delete #{@confirm}? (y/n)")]
@@ -863,6 +901,8 @@ module Devmux
               "  #{chev}#{row_icons(a, assoc: assoc)}#{ann}#{label}"
             end
           base + bind_suffix(a)
+        when :branch
+          branch_row(row)
         when :resource
           resource_row(row)
         when :archive_header
@@ -881,7 +921,9 @@ module Devmux
     # with resources to reveal, blank when it has none. Same glyphs as the
     # Archived disclosure's caret.
     def chevron(agent)
-      return "  " if resource_list(agent).empty?
+      # Expandable when it has resources OR a worktree (whose branch is the tree's
+      # first row), so a worktree-only session still shows the disclosure arrow.
+      return "  " if resource_list(agent).empty? && !agent[:has_worktree]
       @expanded.include?(agent[:name]) ? "▾ " : "▸ "
     end
 
@@ -889,6 +931,16 @@ module Devmux
     # connector (└─ for the last child, ├─ otherwise) descending from the
     # parent's chevron, its icons in full color, then a truncated label (short id
     # + title + any annotation like a queued PR's ETA). Enter opens it.
+    # The worktree branch row (first child of an expanded session): a tree
+    # connector, a branch glyph, and the branch name — all in normal gray. Enter
+    # copies the branch name.
+    def branch_row(row)
+      connector = row[:last] ? "└─" : "├─"
+      icon = Icons.nerd? ? "\u{f126} " : ""
+      budget = cols - 5 - (Icons.nerd? ? 2 : 0) - 1
+      "  \e[38;5;240m#{connector}\e[0m \e[38;5;245m#{icon}#{truncate(row[:branch].to_s, budget)}\e[0m"
+    end
+
     def resource_row(row)
       resource = row[:resource]
       branch = row[:last] ? "└─" : "├─"
@@ -976,6 +1028,8 @@ module Devmux
       items = ["[j/k] move", "[J/K] reorder session"]
       items << "[^u/^d] jump between groups" unless (@groups || []).empty?
       case row && row[:type]
+      when :branch
+        items << "[↵] copy branch"
       when :resource
         items << "[↵] open" << "[d] diff"
       when :group_header

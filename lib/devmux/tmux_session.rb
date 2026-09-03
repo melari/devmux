@@ -70,6 +70,28 @@ module Devmux
       nil
     end
 
+    # Copy text to the system clipboard (pbcopy on macOS, wl-copy/xclip on Linux).
+    # Best-effort; returns true on success, false if no clipboard tool is available
+    # or the write fails.
+    def copy_to_clipboard(text)
+      cmd = clipboard_command
+      return false unless cmd
+      IO.popen(cmd, "w") { |io| io.write(text.to_s) }
+      $?.success?
+    rescue StandardError
+      false
+    end
+
+    def clipboard_command
+      if RUBY_PLATFORM.include?("darwin")
+        ["pbcopy"]
+      elsif !ENV["WAYLAND_DISPLAY"].to_s.empty?
+        ["wl-copy"]
+      else
+        ["xclip", "-selection", "clipboard"]
+      end
+    end
+
     # Open a URL in the user's browser. On macOS, first try to switch to an
     # existing Chrome tab already showing the URL (so clicking a PR icon twice
     # doesn't pile up duplicate tabs); only open a fresh tab if none matches.
@@ -751,6 +773,7 @@ module Devmux
       end
       start_plugin_poller
       start_bind_enforcer
+      start_plugin_updater
     end
 
     # [{ name:, display:, shown:, archived: }] in registry order — the full agent
@@ -775,6 +798,20 @@ module Devmux
           has_worktree: !ctx["worktree"].to_s.empty?,
           bound: bound, bind_status: (bound ? (bind["status"] || "pending") : nil) }
       end
+    end
+
+    # The branch checked out in a session's worktree — the first row of the
+    # expanded tree. nil when the session has no worktree or it can't be read; a
+    # detached HEAD (e.g. while bound) falls back to the short commit sha. Computed
+    # on demand (only for expanded sessions) so it isn't a git call per agent per
+    # refresh.
+    def worktree_branch(name)
+      record = @registry.record(name)
+      dir = ((record && record["context"]) || {})["worktree"].to_s
+      return nil if dir.empty?
+      ref = git(dir, "symbolic-ref", "--quiet", "--short", "HEAD")
+      return ref if ref && !ref.empty?
+      git(dir, "rev-parse", "--short", "HEAD")
     end
 
     # The named groups (in display order) the sidebar buckets sessions into. The
@@ -1042,7 +1079,9 @@ module Devmux
       return nil if dir.empty?
       branch = primary_branch(dir) || "main"
       base = git(dir, "merge-base", branch, "HEAD") || branch
-      "git -C #{dir.shellescape} diff #{base.shellescape}"
+      # --no-optional-locks: diffnav re-runs this on a watch loop inside the
+      # worktree, so don't take the index lock and contend with the agent's git.
+      "git --no-optional-locks -C #{dir.shellescape} diff #{base.shellescape}"
     end
 
     def diff_pane_for(name)
@@ -1225,15 +1264,20 @@ module Devmux
       File.basename(common) == ".git" ? File.dirname(common) : nil
     end
 
+    # All git runs go through here with --no-optional-locks so our background
+    # polling (bind status, worktree branch) never takes the optional index lock
+    # and contends with the agent's own git in that worktree. It only skips
+    # *optional* locks; required locks for real writes (e.g. checkout) are
+    # untouched, so it's safe on git_ok? too.
     def git(dir, *args)
-      out, _err, status = Open3.capture3("git", "-C", dir, *args)
+      out, _err, status = Open3.capture3("git", "--no-optional-locks", "-C", dir, *args)
       status.success? ? out.strip : nil
     rescue StandardError
       nil
     end
 
     def git_ok?(dir, *args)
-      _out, _err, status = Open3.capture3("git", "-C", dir, *args)
+      _out, _err, status = Open3.capture3("git", "--no-optional-locks", "-C", dir, *args)
       status.success?
     rescue StandardError
       false
@@ -1328,35 +1372,52 @@ module Devmux
       {}
     end
 
-    # Background thread that runs enabled plugins' `poll` every POLL_SECONDS.
-    # Isolated from the UI (it only touches the mutex-guarded registry and each
-    # plugin's own store), so a slow `gh` call never blocks the sidebar; the UI
-    # picks up its writes via state_mtime. Per-plugin failures are logged, not
-    # fatal. A daemon thread — it dies with the manager process.
-    # Poll only while devmux is actually attached (a client is looking) — the
-    # manager process keeps running under the detached tmux server, so without
-    # this the poller would keep hitting the network in the background after you
-    # quit. Polls immediately when a client attaches (first open *and* reattach),
-    # then every POLL_SECONDS while it stays attached; pauses when detached.
+    # One background thread per pollable plugin (isolated from the UI, which only
+    # sees each poll's writes via state_mtime). A slow plugin runs on its own
+    # thread at its own cadence, so e.g. beta's slow `beta ls` never delays the
+    # github refresh or the UI. Threads are spawned for every plugin that can poll;
+    # each gates on the plugin being enabled at poll time (so a toggle takes
+    # effect). Daemon threads — they die with the manager process.
     def start_plugin_poller
-      @poller = Thread.new do
+      @pollers = Plugins.all.select { |p| p.respond_to?(:poll) }.map { |p| start_poller_for(p) }
+    end
+
+    # One-shot background thread that updates installed third-party plugin repos
+    # (git fetch + fast-forward), like gitpack does for devmux itself. Runs after
+    # the plugins are already loaded, so there's no read/require race; updates take
+    # effect on the next launch. Best-effort — failures are logged, never fatal.
+    def start_plugin_updater
+      @plugin_updater = Thread.new do
+        Plugins.update_external!(logger: ->(m) { TmuxSession.log_plugin(m) })
+      rescue StandardError => e
+        TmuxSession.log_error("plugin-updater", e)
+      end
+    end
+
+    # A single plugin's poller loop. Polls only while devmux is attached (a client
+    # is looking) and the plugin is enabled — the manager keeps running under the
+    # detached tmux server, so this stops us hitting the network after you quit.
+    # Polls immediately on (re)attach, then every `poll_interval` seconds
+    # (plugin-defined, default POLL_SECONDS); pauses when detached.
+    def start_poller_for(plugin)
+      interval = Plugins.poll_interval(plugin, default: POLL_SECONDS)
+      Thread.new do
         was_attached = false
         last_poll = nil
         loop do
           begin
             attached = tmux_attached?
-            if attached
+            if attached && Plugins.enabled?(plugin.id)
               now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-              just_attached = !was_attached
-              due = last_poll.nil? || (now - last_poll) >= POLL_SECONDS
-              if just_attached || due
-                Plugins.run_poll(@registry, logger: ->(m) { TmuxSession.log_plugin(m) })
+              due = last_poll.nil? || (now - last_poll) >= interval
+              if !was_attached || due
+                Plugins.poll_one(plugin, @registry, logger: ->(m) { TmuxSession.log_plugin(m) })
                 last_poll = now
               end
             end
             was_attached = attached
           rescue StandardError => e
-            TmuxSession.log_error("plugin-poller", e)
+            TmuxSession.log_error("plugin-poller[#{plugin.id}]", e)
           end
           sleep ATTACH_CHECK_SECONDS
         end
