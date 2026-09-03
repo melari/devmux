@@ -1,4 +1,6 @@
 require "json"
+require "yaml"
+require "open3"
 require "fileutils"
 require "devmux/plugin_host"
 require "devmux/plugins/github"
@@ -21,9 +23,12 @@ module Devmux
   #   name                     -> String  (menu label; required)
   #   logo                     -> String  Nerd Font glyph, or nil
   #   provider                 -> { scheme:, body:, short: } identifier scheme, or nil
+  #   context_keys             -> { key => spec } new context keys this plugin adds
   #   examples_for(key)        -> [String] example ids contributed for a context key
-  #   resource_details(id)     -> { state:, color: } for one of its identifiers, or nil
+  #   resource_details(id)     -> { glyph:, color:, icons:, title:, annotation: }, or nil
+  #   resource_url(id)         -> String browser URL for an identifier, or nil
   #   poll(host)               -> background sync (see Devmux::PluginHost)
+  #   poll_interval            -> Integer  seconds between polls (default 30)
   #
   # Enabled/disabled state persists as JSON under the state dir, read fresh on
   # every query (never cached): the plugins menu runs in a separate process (a
@@ -32,10 +37,122 @@ module Devmux
   module Plugins
     BUILTIN = [Github.new, Linear.new, Slack.new].freeze
 
+    # Third-party plugins are git repos installed under `install_dir`, each with a
+    # manifest at its root listing the plugin files/classes to load:
+    #
+    #   # .devmux-plugin.yml
+    #   plugins:
+    #     - { file: beta.rb, class: Devmux::Plugins::Beta }
+    #
+    # `devmux plugins install <git-url>` clones one; the manager updates them
+    # (git fetch + ff) in the background, taking effect on the next launch (they're
+    # loaded once, at first use). This mirrors how gitpack keeps devmux itself
+    # updated. The plugin interface isn't a stable contract yet — pre-release.
+    MANIFEST = ".devmux-plugin.yml".freeze
+
     module_function
 
+    # Built-in plugins plus any installed third-party ones (loaded once, memoized).
     def all
-      BUILTIN
+      BUILTIN + external
+    end
+
+    def external
+      @external ||= load_external
+    end
+
+    # Where installed plugin repos live (code, so under XDG_DATA_HOME, not state).
+    def install_dir
+      base = ENV["XDG_DATA_HOME"] || File.join(Dir.home, ".local", "share")
+      File.join(base, "devmux", "plugins")
+    end
+
+    # Non-fatal per-plugin load errors, surfaced by `devmux plugins list`.
+    def load_errors
+      @load_errors ||= []
+    end
+
+    # Load every installed plugin repo's manifest and instantiate its classes.
+    def load_external
+      @load_errors = []
+      return [] unless File.directory?(install_dir)
+      Dir.children(install_dir).sort.flat_map { |name| load_repo(File.join(install_dir, name)) }
+    rescue StandardError => e
+      (@load_errors ||= []) << "load_external: #{e.class}: #{e.message}"
+      []
+    end
+
+    def load_repo(repo)
+      return [] unless File.directory?(repo)
+      manifest = File.join(repo, MANIFEST)
+      return [] unless File.exist?(manifest)
+      # Put the repo on the load path so a plugin can require sibling files.
+      $LOAD_PATH.unshift(repo) unless $LOAD_PATH.include?(repo)
+      spec = YAML.safe_load(File.read(manifest))
+      Array(spec && spec["plugins"]).filter_map { |entry| load_plugin_entry(repo, entry) }
+    rescue StandardError => e
+      load_errors << "#{File.basename(repo)}/#{MANIFEST}: #{e.class}: #{e.message}"
+      []
+    end
+
+    def load_plugin_entry(repo, entry)
+      file = entry && entry["file"]
+      klass = entry && entry["class"]
+      return nil unless file && klass
+      require File.expand_path(file, repo)
+      Object.const_get(klass).new
+    rescue StandardError => e
+      load_errors << "#{File.basename(repo)}/#{file}: #{e.class}: #{e.message}"
+      nil
+    end
+
+    # Clone a plugin repo into install_dir. Validates it carries a manifest;
+    # otherwise removes the clone. Takes effect on the next devmux launch.
+    def install(git_url, logger: ->(m) { puts m })
+      name = repo_name(git_url)
+      return logger.call("could not derive a name from: #{git_url}") if name.empty?
+      FileUtils.mkdir_p(install_dir)
+      target = File.join(install_dir, name)
+      return logger.call("already installed: #{name} (#{target})") if File.exist?(target)
+      logger.call("cloning #{git_url} …")
+      unless system("git", "clone", "--quiet", git_url, target)
+        logger.call("clone failed")
+        return
+      end
+      unless File.exist?(File.join(target, MANIFEST))
+        FileUtils.rm_rf(target)
+        return logger.call("not a devmux plugin repo (missing #{MANIFEST})")
+      end
+      logger.call("installed #{name}; restart devmux to load it")
+    end
+
+    # Update every installed plugin repo (git fetch + fast-forward), like gitpack.
+    # Called from the manager in the background; updates apply on the next launch.
+    def update_external!(logger: ->(_m) {})
+      return unless File.directory?(install_dir)
+      Dir.children(install_dir).each do |name|
+        repo = File.join(install_dir, name)
+        update_repo(repo, name, logger) if File.directory?(File.join(repo, ".git"))
+      end
+    end
+
+    def update_repo(repo, name, logger)
+      system("git", "-C", repo, "fetch", "--quiet", out: File::NULL, err: File::NULL)
+      local, = Open3.capture2("git", "-C", repo, "rev-parse", "HEAD")
+      remote, status = Open3.capture2("git", "-C", repo, "rev-parse", "@{u}")
+      return unless status.success?
+      return if local.strip == remote.strip
+      if system("git", "-C", repo, "merge", "--ff-only", "--quiet", out: File::NULL, err: File::NULL)
+        logger.call("plugins: updated #{name} (restart to load)")
+      else
+        logger.call("plugins: #{name} has diverged from upstream; skipped")
+      end
+    rescue StandardError => e
+      logger.call("plugins: #{name} update error: #{e.class}: #{e.message}")
+    end
+
+    def repo_name(git_url)
+      File.basename(git_url.to_s.strip.sub(%r{/\z}, "").sub(/\.git\z/, ""))
     end
 
     def find(id)
@@ -112,17 +229,30 @@ module Devmux
 
     # Run one poll cycle: every enabled pollable plugin's `poll`, handed a
     # PluginHost over `registry`. `logger` (a ->(msg){}) receives progress lines;
-    # a per-plugin exception is logged and skipped, never fatal. Shared by the
-    # backend's poller thread and the `devmux plugins poll` debug command.
+    # a per-plugin exception is logged and skipped, never fatal. Used by the
+    # one-shot `devmux plugins poll` debug command (the manager uses per-plugin
+    # poller threads that call poll_one directly).
     def run_poll(registry, logger: ->(_m) {})
       list = pollable
       logger.call("poll cycle: #{list.map(&:id).inspect}")
-      host = PluginHost.new(registry, logger: logger)
-      list.each do |plugin|
-        plugin.poll(host)
-      rescue StandardError => e
-        logger.call("#{plugin.id}: ERROR #{e.class}: #{e.message}")
-      end
+      list.each { |plugin| poll_one(plugin, registry, logger: logger) }
+    end
+
+    # Run a single plugin's `poll` with a fresh PluginHost, logging (never
+    # raising) on error. The unit the per-plugin poller threads call.
+    def poll_one(plugin, registry, logger: ->(_m) {})
+      plugin.poll(PluginHost.new(registry, logger: logger))
+    rescue StandardError => e
+      logger.call("#{plugin.id}: ERROR #{e.class}: #{e.message}")
+    end
+
+    # A plugin's poll cadence in seconds — its `poll_interval` if it defines one,
+    # else `default`. Lets a slow plugin (e.g. beta's `beta ls`) poll less often on
+    # its own thread without holding up the others.
+    def poll_interval(plugin, default:)
+      return default unless plugin.respond_to?(:poll_interval)
+      value = plugin.poll_interval.to_i
+      value.positive? ? value : default
     end
 
     def disabled

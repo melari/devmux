@@ -10,9 +10,9 @@ module Devmux
     #
     #   - resource_details(id): report live state for a github resource (a PR's
     #     open/merged/closed status) and the color its sidebar icon should take.
-    #   - poll(host): list your open PRs and spin up a session for any that
-    #     doesn't have one yet, and refresh the state of PRs already attached to a
-    #     session so their icon color stays current.
+    #   - poll(host): refresh the state of PRs already attached to a session, so
+    #     their icon color/CI/merge-queue ETA stays current. (It does NOT discover
+    #     or create sessions — the poll only touches PRs you've attached yourself.)
     #
     # It's a plain object implementing the devmux plugin interface (no base
     # class), and persists its state in a PluginStore it owns, so resource_details
@@ -30,9 +30,6 @@ module Devmux
       # A PR in the merge queue swaps the PR glyph for a queue marker, in brown.
       QUEUED_ICON = { glyph: "\u{f4db}", color: "38;5;130" }.freeze
 
-      # States that represent live work — a session gets auto-created for these.
-      OPENISH = %w[open draft].freeze
-
       # Extra decoration icon for a PR's CI rollup, shown beside the PR glyph.
       CI_ICONS = {
         "passing" => { glyph: "\u{f058}", color: "38;5;40" },  # check-circle, green
@@ -49,10 +46,6 @@ module Devmux
         "title state isDraft mergeable url " \
         "mergeQueueEntry { estimatedTimeToMerge } " \
         "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
-
-      # How many of your most-recently-updated PRs the discovery half of the poll
-      # considers for auto-creating sessions.
-      DISCOVERY_LIMIT = 50
 
       def initialize
         @store = PluginStore.new("github")
@@ -125,48 +118,24 @@ module Devmux
         details
       end
 
-      # One poll: discover your recent *open* PRs (auto-create a session for any
-      # not attached yet) and refresh the cached state of every PR already
-      # attached to a session (so old, now-merged/closed PRs recolor correctly
-      # even though they've dropped out of the recent-PRs window).
-      #
-      #   - Only OPEN PRs ever create a session. Closed/merged PRs are only of
-      #     interest once already attached — we never spin one up for them.
-      #   - `created` tracks PRs we've auto-created a session for, so one you
-      #     delete isn't resurrected next poll.
+      # One poll: refresh the cached state + CI of every PR already attached to a
+      # session, so its sidebar/title icon color, CI glyph, and merge-queue ETA
+      # stay current. Only touches PRs you've attached yourself — nothing is
+      # discovered or created. A no-op (and no API call) when nothing is attached.
       def poll(host)
         attached_ids = host.sessions.flat_map { |s| s[:prs] }.select { |i| mine?(i) }.uniq
+        return if attached_ids.empty?
 
-        result = fetch(host, attached_ids)
-        return if result.nil? # gh missing / not authenticated / offline — logged.
+        attached = fetch(host, attached_ids)
+        return if attached.nil? # gh missing / not authenticated / offline — logged.
 
-        recent = result[:recent]
-        attached = result[:attached]
-        host.log("github: #{recent.size} recent PR(s) [#{state_summary(recent)}], " \
-                 "#{attached.size}/#{attached_ids.size} attached PR(s) refreshed")
+        host.log("github: refreshed #{attached.size}/#{attached_ids.size} attached PR(s) " \
+                 "[#{state_summary(attached.values)}]")
 
         data = @store.read
         data["resources"] ||= {}
-        data["created"]   ||= []
-
-        # Refresh cached state + CI for attached PRs (authoritative, by explicit id).
         attached.each { |id, pr| data["resources"][id] = store_rec(pr) }
-        # And for any attached PR that also showed up in discovery.
-        recent.each { |pr| data["resources"][pr[:id]] = store_rec(pr) if attached_ids.include?(pr[:id]) }
-
-        created = 0
-        recent.each do |pr|
-          next unless OPENISH.include?(pr[:state]) # never auto-create for closed/merged.
-          next if attached_ids.include?(pr[:id]) || data["created"].include?(pr[:id])
-          host.create_session(name: pr[:title], prs: [pr[:id]])
-          data["created"] << pr[:id]
-          data["resources"][pr[:id]] = store_rec(pr)
-          created += 1
-          host.log("github:   + created session for #{pr[:id]} #{pr[:title].inspect}")
-        end
-
         @store.write(data)
-        host.log("github: done (#{created} session(s) created)")
       end
 
       private
@@ -180,6 +149,12 @@ module Devmux
           "title" => pr[:title], "eta" => pr[:eta] }
       end
 
+      # A compact per-state count for the log line, e.g. "open=1 merged=2".
+      def state_summary(prs)
+        STATE_COLORS.keys.map { |s| "#{s}=#{prs.count { |pr| pr[:state] == s }}" }
+                    .reject { |pair| pair.end_with?("=0") }.join(" ")
+      end
+
       # A compact estimated-time-to-merge from seconds: "<1m", "9m", "1h", "1h20m".
       def format_eta(seconds)
         return nil unless seconds
@@ -190,31 +165,25 @@ module Devmux
         rem.zero? ? "#{hours}h" : "#{hours}h#{rem}m"
       end
 
-      def state_summary(prs)
-        STATE_COLORS.keys.map { |s| "#{s}=#{prs.count { |pr| pr[:state] == s }}" }.join(" ")
-      end
-
-      # Run one GraphQL request covering both halves of the poll, and split the
-      # result into { recent: [pr...], attached: { id => pr } }. Returns nil only
-      # on a hard failure (couldn't reach the API / not authenticated); partial
-      # GraphQL errors (e.g. one inaccessible attached PR) are logged but the rest
-      # of the data is still used.
+      # Fetch the current state of the attached PRs in one GraphQL request, and
+      # return { id => pr }. Returns nil only on a hard failure (couldn't reach the
+      # API / not authenticated); partial GraphQL errors (e.g. one inaccessible
+      # attached PR) are logged but the rest of the data is still used.
       def fetch(host, attached_ids)
-        host&.log("github:   $ gh api graphql — viewer.pullRequests + #{attached_ids.size} attached")
+        host&.log("github:   $ gh api graphql — #{attached_ids.size} attached PR(s)")
         json = graphql(build_query(attached_ids), host)
         return nil unless json
 
-        recent = Array(json.dig("data", "viewer", "pullRequests", "nodes")).filter_map { |n| node_to_pr(n) }
         attached = {}
         attached_ids.each_with_index do |_id, i|
           pr = node_to_pr(json.dig("data", "a#{i}", "pullRequest"))
           attached[pr[:id]] = pr if pr
         end
-        { recent: recent, attached: attached }
+        attached
       end
 
-      # Combined query: the viewer's recent PRs, plus one aliased lookup per
-      # attached PR (by owner/repo/number) so we can refresh even old ones.
+      # One aliased lookup per attached PR (by owner/repo/number), so we can
+      # refresh each one's state regardless of age.
       def build_query(attached_ids)
         aliases = attached_ids.each_with_index.filter_map do |id, i|
           owner, repo, number = parse_id(id)
@@ -222,16 +191,7 @@ module Devmux
           %(a#{i}: repository(owner: "#{owner}", name: "#{repo}") ) +
             %({ pullRequest(number: #{number}) { #{PR_FIELDS} } })
         end
-        <<~GQL
-          query {
-            viewer {
-              pullRequests(first: #{DISCOVERY_LIMIT}, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                nodes { #{PR_FIELDS} }
-              }
-            }
-            #{aliases.join("\n  ")}
-          }
-        GQL
+        "query {\n  #{aliases.join("\n  ")}\n}"
       end
 
       # Return the parsed response hash when it carries a `data` payload (even if

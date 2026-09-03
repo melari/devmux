@@ -115,19 +115,33 @@ end
 # thread inside the manager (`devmux ui`); these let you inspect it from a plain
 # shell.
 def plugins_list
+  builtin = Devmux::Plugins::BUILTIN
   Devmux::Plugins.all.each do |plugin|
     on = Devmux::Plugins.enabled?(plugin.id) ? "on " : "off"
+    origin = builtin.include?(plugin) ? "builtin" : "external"
     caps = []
     caps << "provider" if plugin.respond_to?(:provider) && plugin.provider
     caps << "poll" if plugin.respond_to?(:poll)
     caps << "resource_details" if plugin.respond_to?(:resource_details)
-    puts "[#{on}] #{plugin.id.ljust(10)} #{plugin.name.ljust(12)} (#{caps.join(', ')})"
+    puts "[#{on}] #{plugin.id.ljust(10)} #{plugin.name.ljust(12)} #{origin} (#{caps.join(', ')})"
+  end
+  errors = Devmux::Plugins.load_errors
+  unless errors.empty?
+    puts "\nload errors:"
+    errors.each { |e| puts "  ! #{e}" }
   end
 end
 
+# Install a third-party plugin from a git URL (clones into the devmux plugins
+# dir; takes effect on the next launch).
+def plugins_install(git_url)
+  die "usage: devmux plugins install <git-url>" if git_url.nil?
+  Devmux::Plugins.install(git_url)
+end
+
 # Force one poll cycle now, in the foreground, echoing every plugin log line to
-# the terminal (and the plugin log). This actually creates sessions, so it
-# doubles as "sync my PRs right now."
+# the terminal (and the plugin log). Refreshes the cached state of resources
+# attached to sessions (e.g. PR status/colors) — it doesn't create any sessions.
 def plugins_poll
   Devmux::Plugins.run_poll(registry, logger: lambda do |msg|
     puts msg
@@ -237,10 +251,11 @@ when "show"
 when "plugins"
   # Debug/inspect the plugin system from a shell.
   case ARGV.shift
-  when "list" then plugins_list
-  when "poll" then plugins_poll
-  when "log"  then plugins_log
-  else die "usage: devmux plugins list|poll|log"
+  when "list"    then plugins_list
+  when "poll"    then plugins_poll
+  when "log"     then plugins_log
+  when "install" then plugins_install(ARGV.shift)
+  else die "usage: devmux plugins list|poll|log|install <git-url>"
   end
 when "context"
   # Read/write a session's context key/value pairs. Agents address themselves
@@ -262,7 +277,8 @@ else
   warn "  tmux-toggle   toggle the manager drawer (used by the Ctrl-Space bind)"
   warn "  settings-menu   the settings menu: plugins + groups (used inside the manager's popup)"
   warn "  project-picker  pick a project for a new agent (used inside the manager's popup)"
-  warn "  plugins list|poll|log   inspect plugins / force a poll now / show the plugin log"
+  warn "  plugins list|poll|log            inspect plugins / force a poll now / show the plugin log"
+  warn "  plugins install <git-url>        install a third-party plugin repo"
   warn "  show <file> [line|start-end]   show a file in a vim pane above this agent"
   warn "  context read <session_id>"
   warn "  context write <session_id> <key> <value...>   keys: name, worktree, prs, tickets"
