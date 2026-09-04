@@ -72,6 +72,7 @@ module Devmux
       @hints_expanded = false # key hints hidden until toggled with "?"
       @collapsed_groups = Set.new # group ids whose members are hidden
       @flash = nil          # transient footer message (e.g. "copied!")
+      @actions_menu = nil   # non-nil ({items:, sel:}) while the "m" menu is open
       refresh
     end
 
@@ -232,6 +233,7 @@ module Devmux
       when "v"        then open_editor_selected
       when "c"        then open_console_selected(:worktree)
       when "C"        then open_console_selected(:main)
+      when "m"        then open_actions_menu
       when "r"        then rename_selected
       when "z"        then @backend.open_settings
       when "?"        then @hints_expanded = !@hints_expanded
@@ -471,6 +473,36 @@ module Devmux
     def open_console_selected(target)
       name = selected_agent_name
       @backend.open_console(name, target: target) if name
+    end
+
+    # "m" — a modal menu of plugin command actions for the hovered session, drawn
+    # in the footer. j/k move, Enter runs the highlighted action (start/stop its
+    # background process), Esc closes. Blocks the main loop while open, like rename.
+    def open_actions_menu
+      name = selected_agent_name
+      return unless name
+      items = @backend.actions_for(name)
+      return flash("no actions") if items.empty?
+      @actions_menu = { items: items, sel: 0 }
+      chosen = nil
+      loop do
+        render
+        case (key = read_key_blocking)
+        when "j", :down then @actions_menu[:sel] = (@actions_menu[:sel] + 1) % items.size
+        when "k", :up   then @actions_menu[:sel] = (@actions_menu[:sel] - 1) % items.size
+        when "\r", "\n" then chosen = items[@actions_menu[:sel]]; break
+        when "\e", "q"  then break
+        end
+      end
+      @actions_menu = nil
+      render
+      return unless chosen
+      result = @backend.run_action(name, chosen[:plugin_id], chosen[:action_id])
+      flash(action_result_message(result)) if result
+    end
+
+    def action_result_message(result)
+      { started: "started", stopped: "stopped", needs_open: "open the session first" }[result]
     end
 
     # Show a diff for the hovered row in a pane above its agent (through diffnav):
@@ -773,7 +805,7 @@ module Devmux
     # No checkbox. The bind icon's width is reserved so the name doesn't push it
     # off the narrow drawer.
     def compact_row(agent)
-      budget = cols - compact_icons_cols(agent) - bind_cols(agent) - 1
+      budget = cols - compact_icons_cols(agent) - bind_cols(agent) - bg_cols(agent) - 1
       name = truncate(agent[:display_plain].to_s, budget)
       body =
         if agent[:shown]
@@ -782,7 +814,7 @@ module Devmux
           # Pane closed → name faint, but association icons keep their dimmed color.
           "#{compact_icons(agent, mode: :dim)}#{faint_seg(name)}"
         end
-      body + bind_suffix(agent)
+      body + bind_suffix(agent) + bg_suffix(agent)
     end
 
     # Agent glyph + one ticket/PR glyph per association, each with a trailing
@@ -828,7 +860,9 @@ module Devmux
     # background when expanded). Any error is appended as the very last line.
     def draw_bottom
       block =
-        if flash_active?
+        if @actions_menu
+          actions_menu_block
+        elsif flash_active?
           ["\e[1;38;5;40m#{center(@flash)}\e[0m"] # brief confirmation, e.g. "copied!"
         elsif @rename_buf
           [center("rename: #{@rename_buf}▏")]
@@ -845,6 +879,18 @@ module Devmux
         $stdout.write(line)
         $stdout.write("\r\n") unless i == block.size - 1
       end
+    end
+
+    # The actions-menu block (gray footer panel): a title, one line per action with
+    # a ❯ cursor on the highlighted one, and the keybind hints.
+    def actions_menu_block
+      m = @actions_menu
+      lines = [hint_bg_line("  actions")]
+      m[:items].each_with_index do |item, i|
+        cursor = i == m[:sel] ? "❯ " : "  "
+        lines << hint_bg_line("  #{cursor}#{item[:label]}")
+      end
+      lines << hint_bg_line("  [j/k] move   [↵] select   [esc] close")
     end
 
     # The key-hints block: one dim "[?] help" line when collapsed, or the full
@@ -900,7 +946,7 @@ module Devmux
             else
               "  #{chev}#{row_icons(a, assoc: assoc)}#{ann}#{label}"
             end
-          base + bind_suffix(a)
+          base + bind_suffix(a) + bg_suffix(a)
         when :branch
           branch_row(row)
         when :resource
@@ -986,7 +1032,7 @@ module Devmux
     # the drawer width minus the fixed prefix (indent + cursor + icons), the
     # bound icon, and a right margin.
     def label_budget(agent)
-      cols - 4 - row_icons_cols(agent) - annotations_cols(agent) - bind_cols(agent) - 1
+      cols - 4 - row_icons_cols(agent) - annotations_cols(agent) - bind_cols(agent) - bg_cols(agent) - 1
     end
 
     # Terminal columns the leading icons occupy: checkbox + agent glyph (2 cells
@@ -1018,6 +1064,20 @@ module Devmux
       agent[:bound] && Icons.nerd? ? 2 : 0
     end
 
+    # A trailing indicator per running plugin background process (the plugin's
+    # glyph in the attention color), right-floated after the bind icon — the
+    # enforced-visible "this is running" signal. "" when none / no Nerd Font.
+    def bg_suffix(agent)
+      inds = agent[:background] || []
+      return "" if inds.empty? || !Icons.nerd?
+      inds.map { |i| " \e[#{i[:color] || '38;5;214'}m#{i[:icon]}\e[0m" }.join
+    end
+
+    def bg_cols(agent)
+      return 0 unless Icons.nerd?
+      (agent[:background] || []).size * 2
+    end
+
     # Key hints for the expanded section, one per line, filtered to what the
     # hovered row actually supports (as the old footer did) but with the reorder /
     # group-jump actions spelled out. [↵] is open on a resource row, tree/toggle
@@ -1044,6 +1104,7 @@ module Devmux
         end
         items << "[a] archive" unless a[:archived]
         items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
+        items << "[m] actions"
         items << "[p] PR" unless a[:resources]["prs"].empty?
         items << "[t] ticket" unless a[:resources]["tickets"].empty?
         items << "[↵] tree" unless resource_list(a).empty?

@@ -4,8 +4,9 @@ module Devmux
   # depends on this surface:
   #
   #   host.sessions
-  #     -> [{ name:, prs: [ids], tickets: [ids] }, ...] for every session, so the
-  #        plugin can tell which resources are attached and refresh their state.
+  #     -> [{ name:, prs: [ids], tickets: [ids], worktree:, context: }, ...] for
+  #        every session, so the plugin can tell which resources are attached,
+  #        refresh their state, and (via worktree/context) compare against local.
   #   host.log(message)
   #     -> record a line of plugin activity (goes to the plugin log in the
   #        background poller; also echoed to stdout under `devmux plugins poll`).
@@ -27,7 +28,8 @@ module Devmux
     def sessions
       @registry.agents.map do |a|
         ctx = a["context"] || {}
-        { name: a["name"], prs: Array(ctx["prs"]), tickets: Array(ctx["tickets"]) }
+        { name: a["name"], prs: Array(ctx["prs"]), tickets: Array(ctx["tickets"]),
+          worktree: ctx["worktree"], context: ctx }
       end
     end
   end

@@ -286,7 +286,7 @@ module Devmux
     end
 
     def confirm_restart?
-      $stderr.print "devmux was updated since this session started. " \
+      $stderr.print "devmux or its plugins were updated since this session started. " \
                     "Restart it? Running agents will be killed. [y/N] "
       answer = $stdin.gets
       !answer.nil? && answer.strip.downcase.start_with?("y")
@@ -294,19 +294,28 @@ module Devmux
       false
     end
 
-    # A hash of devmux's own source (bin + lib) — what actually determines how a
-    # running session behaves. Catches uncommitted edits too, and doesn't churn
-    # on doc-only changes. Swap in `git rev-parse HEAD` here if you'd rather key
-    # off commits.
+    # A hash of everything that determines how a running session behaves: devmux's
+    # own source (bin + lib) AND the installed third-party plugins' files. Catches
+    # uncommitted edits, and — crucially — installing or updating a plugin (which
+    # lives outside the repo, so bin/lib is unchanged) also changes this, so the
+    # relaunch prompt fires and the stale manager gets restarted to load it.
+    # Entries are (label, path) pairs so the hash is stable regardless of absolute
+    # location; the .git internals of plugin repos are skipped.
     def repo_stamp(exe_path)
       root = File.expand_path("..", File.dirname(exe_path))
-      files = Dir.glob(File.join(root, "{bin,lib}", "**", "*"))
-                 .select { |f| File.file?(f) }.sort
-      return nil if files.empty?
+      entries = []
+      Dir.glob(File.join(root, "{bin,lib}", "**", "*")).each do |f|
+        entries << [f.sub(root, ""), f] if File.file?(f)
+      end
+      Dir.glob(File.join(Plugins.install_dir, "**", "*"), File::FNM_DOTMATCH).each do |f|
+        next if f.split(File::SEPARATOR).include?(".git")
+        entries << ["plugin:#{f.sub(Plugins.install_dir, '')}", f] if File.file?(f)
+      end
+      return nil if entries.empty?
       digest = Digest::SHA1.new
-      files.each do |f|
-        digest.update(f.sub(root, ""))
-        digest.update(File.read(f))
+      entries.sort_by(&:first).each do |label, path|
+        digest.update(label)
+        digest.update(File.read(path))
       end
       digest.hexdigest[0, 16]
     rescue StandardError
@@ -696,11 +705,15 @@ module Devmux
                ',#{?#{==:#{@devmux_bind},dirty},' + yellow_fg + " #{Icons::NERD_SERVER_DIRTY} worktree bound (partial)  " +
                ',#{?#{==:#{@devmux_bind},binding},' + gray_fg + " #{Icons::NERD_SERVER_BINDING} worktree binding…  " +
                ',#{?#{==:#{@devmux_bind},broken},' + red_fg + " #{Icons::NERD_SERVER_BROKEN} worktree bind failed  " + ',}}}}'
+      # A plugin's running background-process marker (icon + name, e.g. the beta
+      # sync glyph + "beta sync"), from the @devmux_bg pane option — re-expanded so
+      # its own color applies. Enforced visible whenever such a process runs.
+      background = '#{E:@devmux_bg}'
       # Resource icons (ticket/PR/CI) after the label, from the @devmux_icons pane
       # option. #{E:...} re-expands it so the tmux #[fg=...] styles it carries are
       # interpreted (a plain #{...} would print them literally).
       icons = '#{E:@devmux_icons}'
-      style + '#[align=centre] ' + marker + style + label + ' ' + icons
+      style + '#[align=centre] ' + marker + background + style + label + ' ' + icons
     end
   end
 
@@ -737,10 +750,20 @@ module Devmux
     DIFF_OPTION = "@devmux_diff".freeze
     # And for an agent's "console" pane (the `c` key): a raw shell, one per agent.
     CONSOLE_OPTION = "@devmux_console".freeze
+    # Pane user-option holding the running background-process marker (a plugin's
+    # icon + name), shown in the title while a plugin action's process runs.
+    BG_OPTION = "@devmux_bg".freeze
+    # Fixed attention color for background-process indicators (title + sidebar).
+    BG_COLOR = "38;5;214".freeze
 
     # How often (seconds) the bind enforcer reconciles the main repo with the
     # bound session's worktree. Under the 3s the feature promises.
     BIND_INTERVAL = 2
+
+    # How often (seconds) the background-process supervisor checks that every
+    # running plugin process is still allowed to run (devmux attached + its agent
+    # pane open); kept short so a detach kills promptly (never left running unseen).
+    BG_SUPERVISE_SECONDS = 1
 
     # How often (seconds) the background poller runs enabled plugins' `poll`
     # while devmux is attached, and how often it wakes to check attachment (so a
@@ -756,6 +779,11 @@ module Devmux
       @registry = Registry.new(@state_file)
       @bind_file = File.join(TmuxSession.state_dir, "bind.json")
       @bind_mutex = Mutex.new
+      # Plugin background processes: key "uuid\tplugin\taction" => {pid, name, ...}.
+      # Manager-owned; the supervisor keeps them alive only while visible.
+      @bg_procs = {}
+      @bg_mutex = Mutex.new
+      @bg_file = File.join(TmuxSession.state_dir, "background.json")
       # Last-processed "show" request token per session uuid. Seed from existing
       # request files so stale ones from a previous run aren't re-opened.
       @show_tokens = seen_show_tokens
@@ -774,6 +802,10 @@ module Devmux
       start_plugin_poller
       start_bind_enforcer
       start_plugin_updater
+      start_bg_supervisor
+      # Backstop: kill any plugin background processes if the manager exits cleanly
+      # (the per-process watchdog covers hard kills / tmux kill-server).
+      at_exit { stop_all_actions }
     end
 
     # [{ name:, display:, shown:, archived: }] in registry order — the full agent
@@ -796,6 +828,9 @@ module Devmux
           # nil when the id points at a since-deleted group).
           group: (group_ids.include?(gid) ? gid : nil),
           has_worktree: !ctx["worktree"].to_s.empty?,
+          # Running plugin background processes (icon + name), shown right-floated
+          # in the sidebar and enforced visible while they run.
+          background: bg_indicators(a["uuid"]),
           bound: bound, bind_status: (bound ? (bind["status"] || "pending") : nil) }
       end
     end
@@ -874,6 +909,7 @@ module Devmux
         close_vim_pane(name)
         close_diff_pane(name)
         close_console_pane(name)
+        stop_session_actions(name)
         hide_pane(pane)
       else
         # Showing an archived agent brings it back to the active list.
@@ -890,6 +926,7 @@ module Devmux
         close_vim_pane(name)
         close_diff_pane(name)
         close_console_pane(name)
+        stop_session_actions(name)
         @tmux.close(pane)
         TmuxSession.rebalance_agents(@tmux)
       end
@@ -909,6 +946,7 @@ module Devmux
         close_vim_pane(name)
         close_diff_pane(name)
         close_console_pane(name)
+        stop_session_actions(name)
         @tmux.close(pane)
         TmuxSession.rebalance_agents(@tmux)
       end
@@ -959,6 +997,146 @@ module Devmux
     def focus_agent(name)
       pane = shown_panes[name]
       @tmux.focus(pane) if pane
+    end
+
+    # ---- plugin command actions (the "m" menu) ----
+
+    # The actions available for a session, each with its current running state and
+    # the label to show (start label, or the plugin's active/stop label when the
+    # process is running). Consumed by the UI's inline actions menu.
+    def actions_for(name)
+      record = @registry.record(name)
+      return [] unless record
+      ctx = record["context"] || {}
+      uuid = record["uuid"]
+      Plugins.actions(ctx).map do |a|
+        running = bg_running?(bg_key(uuid, a[:plugin_id], a[:id]))
+        label = running ? (a[:active_label] || "Stop #{a[:name]}") : a[:label]
+        { plugin_id: a[:plugin_id], action_id: a[:id], label: label, running: running }
+      end
+    end
+
+    # Toggle a plugin action for a session: stop it if its background process is
+    # running, else start it. Returns :started / :stopped / :needs_open / nil so
+    # the UI can flash a result. Starting requires the agent pane to be open (the
+    # running indicator lives on the title, and the process is only allowed to run
+    # while visible).
+    def run_action(name, plugin_id, action_id)
+      record = @registry.record(name)
+      return nil unless record
+      uuid = record["uuid"]
+      key = bg_key(uuid, plugin_id, action_id)
+      if bg_running?(key)
+        stop_action(key)
+        bg_changed
+        return :stopped
+      end
+      return :needs_open unless shown_panes.key?(name)
+      action = Plugins.actions(record["context"] || {})
+                      .find { |a| a[:plugin_id] == plugin_id && a[:id] == action_id }
+      return nil unless action
+      start_action(record, action)
+      bg_changed
+      :started
+    end
+
+    def bg_key(uuid, plugin_id, action_id)
+      "#{uuid}\t#{plugin_id}\t#{action_id}"
+    end
+
+    def bg_running?(key)
+      @bg_mutex.synchronize { @bg_procs.key?(key) }
+    end
+
+    # Spawn the action's command as a manager-owned background process and record
+    # it. See spawn_bg for how it's tied to the manager's lifetime.
+    def start_action(record, action)
+      command = Array(action[:command])
+      return if command.empty?
+      pid = spawn_bg(command)
+      return unless pid
+      key = bg_key(record["uuid"], action[:plugin_id], action[:id])
+      @bg_mutex.synchronize do
+        @bg_procs[key] = { pid: pid, name: record["name"], uuid: record["uuid"],
+                           plugin_id: action[:plugin_id], action_id: action[:id],
+                           icon: action[:icon], indicator: action[:name], color: action[:color] }
+      end
+    end
+
+    def stop_action(key)
+      entry = @bg_mutex.synchronize { @bg_procs.delete(key) }
+      kill_bg(entry[:pid]) if entry
+    end
+
+    # Stop every background process belonging to a session (on hide/archive/delete).
+    def stop_session_actions(name)
+      keys = @bg_mutex.synchronize { @bg_procs.select { |_k, e| e[:name] == name }.keys }
+      return if keys.empty?
+      keys.each { |k| stop_action(k) }
+      bg_changed
+    end
+
+    # Kill everything (manager exit backstop). Synchronous, best-effort.
+    def stop_all_actions
+      entries = @bg_mutex.synchronize { es = @bg_procs.values; @bg_procs.clear; es }
+      entries.each { |e| Process.kill("-TERM", e[:pid]) rescue nil }
+    end
+
+    # Run `command` (argv) as a background process in its own process group, wrapped
+    # in a watchdog that exits (killing the command) as soon as EITHER the command
+    # finishes OR the manager process disappears. The watchdog is the backstop for
+    # the manager dying without a chance to clean up (tmux kill-server, crash, even
+    # SIGKILL); the supervisor thread handles detach / pane-close while the manager
+    # is alive. Returns the watchdog's pid (the process-group leader) or nil.
+    def spawn_bg(command)
+      manager = Process.pid
+      inner = Shellwords.join(command)
+      wrapper = "#{inner} & cmd=$!; " \
+                "while kill -0 #{manager} 2>/dev/null && kill -0 $cmd 2>/dev/null; do sleep 1; done; " \
+                "kill -TERM $cmd 2>/dev/null"
+      log = File.join(TmuxSession.state_dir, "bg.log")
+      Process.spawn("/bin/sh", "-c", wrapper, pgroup: true, in: File::NULL,
+                    out: [log, "a"], err: [log, "a"])
+    rescue StandardError => e
+      TmuxSession.log_error("bg-spawn", e)
+      nil
+    end
+
+    # SIGTERM the process group, then escalate to SIGKILL and reap in the
+    # background so we don't block or leave a zombie.
+    def kill_bg(pid)
+      Process.kill("-TERM", pid)
+    rescue Errno::ESRCH
+      nil
+    ensure
+      Thread.new do
+        sleep 2
+        Process.kill("-KILL", pid) rescue nil
+        Process.waitpid(pid) rescue nil
+      end
+    end
+
+    # The running-process indicators (icon + name) for a session, for the sidebar
+    # and title. Empty when nothing is running for it.
+    def bg_indicators(uuid)
+      @bg_mutex.synchronize do
+        @bg_procs.values.select { |e| e[:uuid] == uuid }
+                 .map { |e| { icon: e[:icon], name: e[:indicator], color: e[:color] } }
+      end
+    end
+
+    # Called whenever @bg_procs changes: repaint the title markers and bump the
+    # background state file so the UI re-renders the sidebar (it reads @bg_procs
+    # live via agents, but needs a state_mtime nudge to refresh without a keypress).
+    def bg_changed
+      touch_bg_file
+      sync_panes
+    end
+
+    def touch_bg_file
+      File.write(@bg_file, Time.now.to_f.to_s)
+    rescue StandardError
+      nil
     end
 
     # Manually open the agent's editor pane (the same split the `show` flow uses):
@@ -1141,7 +1319,7 @@ module Devmux
     # whether that's an agent writing its own context (registry), a plugin poll
     # caching state (plugin store), or the bind enforcer flipping ok/broken.
     def state_mtime
-      files = [@state_file, @bind_file, File.join(TmuxSession.state_dir, "groups.json")] +
+      files = [@state_file, @bind_file, @bg_file, File.join(TmuxSession.state_dir, "groups.json")] +
               Dir.glob(File.join(TmuxSession.state_dir, "plugin-*.json")) +
               Dir.glob(File.join(TmuxSession.state_dir, "show-*.json"))
       files.map { |f| File.mtime(f) rescue nil }.compact.max
@@ -1394,6 +1572,53 @@ module Devmux
       end
     end
 
+    # Supervises plugin background processes: enforces that each runs ONLY while
+    # devmux is attached and its agent pane is open — so a running process's
+    # indicator is always visible (detach or pane-close kills it within a second).
+    # Also reaps processes that ended on their own. The per-process watchdog covers
+    # the manager itself dying; this covers everything while the manager is alive.
+    def start_bg_supervisor
+      @bg_supervisor = Thread.new do
+        loop do
+          begin
+            supervise_bg
+          rescue StandardError => e
+            TmuxSession.log_error("bg-supervisor", e)
+          end
+          sleep BG_SUPERVISE_SECONDS
+        end
+      end
+    end
+
+    def supervise_bg
+      return if @bg_mutex.synchronize { @bg_procs.empty? }
+      attached = tmux_attached?
+      panes = shown_panes
+      ended = []
+      kill = []
+      @bg_mutex.synchronize do
+        @bg_procs.each do |key, e|
+          if reaped?(e[:pid]) then ended << key
+          elsif !attached || !panes.key?(e[:name]) then kill << key
+          end
+        end
+      end
+      return if ended.empty? && kill.empty?
+      ended.each { |k| @bg_mutex.synchronize { @bg_procs.delete(k) } }
+      kill.each { |k| stop_action(k) }
+      bg_changed
+    end
+
+    # True if the child has exited (and reaps it). Treats an already-reaped/unknown
+    # pid as ended.
+    def reaped?(pid)
+      !Process.waitpid(pid, Process::WNOHANG).nil?
+    rescue Errno::ECHILD
+      true
+    rescue StandardError
+      false
+    end
+
     # A single plugin's poller loop. Polls only while devmux is attached (a client
     # is looking) and the plugin is enabled — the manager keeps running under the
     # detached tmux server, so this stops us hitting the network after you quit.
@@ -1443,9 +1668,21 @@ module Devmux
         @tmux.set_pane_option(pane_id, BAR_OPTION, agent_state(record))
         @tmux.set_pane_option(pane_id, ICONS_OPTION, TmuxSession.title_icons(record))
         @tmux.set_pane_option(pane_id, BIND_OPTION, bind_marker(record, bind))
+        @tmux.set_pane_option(pane_id, BG_OPTION, bg_title_marker(record))
       end
       # Repaint now so the new colors show immediately, not on tmux's next tick.
       @tmux.refresh_client
+    end
+
+    # The @devmux_bg title marker: each running background process's icon + name in
+    # the attention color, or "" when none. Re-expanded in pane-border-format.
+    def bg_title_marker(record)
+      indicators = bg_indicators(record["uuid"])
+      return "" if indicators.empty?
+      indicators.map do |i|
+        tmux = TmuxSession.tmux_color(i[:color] || BG_COLOR)
+        "#[fg=#{tmux}]#{i[:icon]} #{i[:name]}"
+      end.join(" ") + "  "
     end
 
     # The @devmux_bind value for a pane: "ok"/"broken"/"pending" if this record is

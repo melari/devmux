@@ -29,6 +29,9 @@ module Devmux
   #   resource_url(id)         -> String browser URL for an identifier, or nil
   #   poll(host)               -> background sync (see Devmux::PluginHost)
   #   poll_interval            -> Integer  seconds between polls (default 30)
+  #   actions(context)         -> [ { id:, label:, active_label:, command:[argv],
+  #                                   icon:, name: } ] command actions for the
+  #                                "m" menu; a background (long-running) toggle.
   #
   # Enabled/disabled state persists as JSON under the state dir, read fresh on
   # every query (never cached): the plugins menu runs in a separate process (a
@@ -225,6 +228,16 @@ module Devmux
     # Enabled plugins that do background polling.
     def pollable
       enabled.select { |p| p.respond_to?(:poll) }
+    end
+
+    # Command actions available for a session context, across enabled plugins,
+    # each tagged with its owning plugin's id. Consumed by the "m" actions menu.
+    def actions(context)
+      enabled.select { |p| p.respond_to?(:actions) }.flat_map do |plugin|
+        Array(plugin.actions(context)).map { |a| a.merge(plugin_id: plugin.id) }
+      end
+    rescue StandardError
+      []
     end
 
     # Run one poll cycle: every enabled pollable plugin's `poll`, handed a
