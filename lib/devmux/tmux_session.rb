@@ -1048,6 +1048,14 @@ module Devmux
       @bg_mutex.synchronize { @bg_procs.key?(key) }
     end
 
+    # A snapshot of running background actions for the plugin poller to hand to
+    # PluginHost, so a plugin can see which of its own actions are running.
+    def running_actions
+      @bg_mutex.synchronize do
+        @bg_procs.values.map { |e| { uuid: e[:uuid], plugin_id: e[:plugin_id], action_id: e[:action_id] } }
+      end
+    end
+
     # Spawn the action's command as a manager-owned background process and record
     # it. See spawn_bg for how it's tied to the manager's lifetime.
     def start_action(record, action)
@@ -1636,7 +1644,8 @@ module Devmux
               now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
               due = last_poll.nil? || (now - last_poll) >= interval
               if !was_attached || due
-                Plugins.poll_one(plugin, @registry, logger: ->(m) { TmuxSession.log_plugin(m) })
+                Plugins.poll_one(plugin, @registry, logger: ->(m) { TmuxSession.log_plugin(m) },
+                                 running: running_actions)
                 last_poll = now
               end
             end

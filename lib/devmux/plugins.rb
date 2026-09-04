@@ -252,9 +252,11 @@ module Devmux
     end
 
     # Run a single plugin's `poll` with a fresh PluginHost, logging (never
-    # raising) on error. The unit the per-plugin poller threads call.
-    def poll_one(plugin, registry, logger: ->(_m) {})
-      plugin.poll(PluginHost.new(registry, logger: logger))
+    # raising) on error. `running` is the current background-action snapshot the
+    # host exposes so a plugin can react to its own running actions. The unit the
+    # per-plugin poller threads call.
+    def poll_one(plugin, registry, logger: ->(_m) {}, running: [])
+      plugin.poll(PluginHost.new(registry, logger: logger, running: running))
     rescue StandardError => e
       logger.call("#{plugin.id}: ERROR #{e.class}: #{e.message}")
     end
