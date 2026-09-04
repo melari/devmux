@@ -1690,7 +1690,8 @@ module Devmux
         worktree = ((a["context"] || {})["worktree"]).to_s
         next if worktree.empty? || current.key?(worktree)
         sha = git(worktree, "rev-parse", "HEAD")
-        current[worktree] = sha if sha && !sha.empty?
+        next if sha.nil? || sha.empty?
+        current[worktree] = { "sha" => sha, "dirty" => worktree_dirty?(worktree) }
       end
       return if current == Devmux::Worktrees.all
       write_worktrees(current)
