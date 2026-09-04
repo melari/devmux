@@ -1898,13 +1898,17 @@ module Devmux
     end
 
     # Where to open an agent's pane, in precedence order:
-    #   1. the agent's own recorded project (chosen via the N picker),
-    #   2. the configured default project (seeded from the first launch dir),
-    #   3. the directory devmux was last launched from (session option), then
+    #   1. the session's worktree, once it has one — so reopening a pane lands the
+    #      agent back in its worktree (not the main repo), keeping its cwd stable,
+    #   2. the agent's own recorded project (chosen via the N picker),
+    #   3. the configured default project (seeded from the first launch dir),
+    #   4. the directory devmux was last launched from (session option), then
     #      the manager pane's cwd, then Dir.pwd.
     # So each agent runs in *its* repo, and the dir devmux itself was launched
     # from no longer dictates where agents land.
     def agent_cwd(record = nil)
+      worktree = record && ((record["context"] || {})["worktree"]).to_s
+      return worktree if worktree && !worktree.empty? && File.directory?(worktree)
       project = record && record["project"].to_s
       return project if project && !project.empty? && File.directory?(project)
       default = Projects.default
