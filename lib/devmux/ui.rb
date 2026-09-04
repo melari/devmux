@@ -227,7 +227,6 @@ module Devmux
       when "d"        then show_diff_selected
       when "n"        then @backend.new_agent
       when "N"        then @backend.new_agent_pick
-      when "b"        then bind_selected
       when "p"        then open_pr
       when "t"        then open_ticket
       when "v"        then open_editor_selected
@@ -441,13 +440,6 @@ module Devmux
       @backend.archive(a[:name]) if a && !a[:archived]
     end
 
-    # Bind/unbind the selected session to the main repo (needs a worktree; the
-    # backend no-ops without one).
-    def bind_selected
-      a = selected_agent
-      @backend.toggle_bind(a[:name]) if a
-    end
-
     # Open the selected session's first associated pull request in the browser,
     # then return focus to its agent pane (if open) so the terminal is on the
     # agent when you come back.
@@ -502,7 +494,8 @@ module Devmux
     end
 
     def action_result_message(result)
-      { started: "started", stopped: "stopped", needs_open: "open the session first" }[result]
+      { started: "started", stopped: "stopped", needs_open: "open the session first",
+        bound: "binding…", unbound: "unbound" }[result]
     end
 
     # Show a diff for the hovered row in a pane above its agent (through diffnav):
@@ -1081,8 +1074,8 @@ module Devmux
     # Key hints for the expanded section, one per line, filtered to what the
     # hovered row actually supports (as the old footer did) but with the reorder /
     # group-jump actions spelled out. [↵] is open on a resource row, tree/toggle
-    # on an agent; [b] reads "unbind" when bound and is hidden without a worktree;
-    # [p]/[t] only with a PR/ticket; the group-jump line only when groups exist.
+    # on an agent; [p]/[t] only with a PR/ticket; the group-jump line only when
+    # groups exist. (Worktree bind now lives in the [m] actions menu.)
     def hint_items
       row = @rows[@sel]
       items = ["[j/k] move", "[J/K] reorder session"]
@@ -1097,11 +1090,6 @@ module Devmux
       when :agent
         a = row[:agent]
         items << "[space] show/hide" << "[r] rename"
-        if a[:bound]
-          items << "[b] unbind"
-        elsif !a[:archived] && a[:has_worktree]
-          items << "[b] bind"
-        end
         items << "[a] archive" unless a[:archived]
         items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
         items << "[m] actions"

@@ -1016,11 +1016,31 @@ module Devmux
       return [] unless record
       ctx = record["context"] || {}
       uuid = record["uuid"]
-      Plugins.actions(ctx).map do |a|
+      plugin_actions = Plugins.actions(ctx).map do |a|
         running = bg_running?(bg_key(uuid, a[:plugin_id], a[:id]))
         label = running ? (a[:active_label] || "Stop #{a[:name]}") : a[:label]
         { plugin_id: a[:plugin_id], action_id: a[:id], label: label, running: running }
       end
+      builtin_actions(record) + plugin_actions
+    end
+
+    # devmux's own actions in the "m" menu (plugin_id "devmux"), shown alongside
+    # plugin ones. Worktree bind lives here (it used to be the "b" key): shown as
+    # "Unbind worktree" when bound, else "Bind worktree" when the session has a
+    # worktree and isn't archived.
+    def builtin_actions(record)
+      if bound?(record)
+        [{ plugin_id: "devmux", action_id: "bind", label: "Unbind worktree", running: true }]
+      elsif !record["archived"] && !((record["context"] || {})["worktree"]).to_s.empty?
+        [{ plugin_id: "devmux", action_id: "bind", label: "Bind worktree", running: false }]
+      else
+        []
+      end
+    end
+
+    def bound?(record)
+      uuid = bind_state["uuid"].to_s
+      !uuid.empty? && uuid == record["uuid"]
     end
 
     # Toggle a plugin action for a session: stop it if its background process is
@@ -1031,6 +1051,7 @@ module Devmux
     def run_action(name, plugin_id, action_id)
       record = @registry.record(name)
       return nil unless record
+      return run_builtin_action(name, record, action_id) if plugin_id == "devmux"
       uuid = record["uuid"]
       key = bg_key(uuid, plugin_id, action_id)
       if bg_running?(key)
@@ -1045,6 +1066,17 @@ module Devmux
       start_action(record, action)
       bg_changed
       :started
+    end
+
+    # Run a devmux built-in action from the "m" menu. Returns a symbol for the UI
+    # to flash.
+    def run_builtin_action(name, record, action_id)
+      case action_id
+      when "bind"
+        was_bound = bound?(record)
+        toggle_bind(name)
+        was_bound ? :unbound : :bound
+      end
     end
 
     def bg_key(uuid, plugin_id, action_id)
