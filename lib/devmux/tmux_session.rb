@@ -9,6 +9,7 @@ require "devmux/plugins"
 require "devmux/plugin_host"
 require "devmux/projects"
 require "devmux/groups"
+require "devmux/worktrees"
 require "devmux/icons"
 
 module Devmux
@@ -765,6 +766,11 @@ module Devmux
     # pane open); kept short so a detach kills promptly (never left running unseen).
     BG_SUPERVISE_SECONDS = 1
 
+    # How often (seconds) the manager refreshes each session worktree's HEAD sha
+    # into the Worktrees store (for plugins). Frequent + --no-optional-locks so
+    # it's responsive without contending with agents' git.
+    WORKTREE_TRACK_SECONDS = 1
+
     # How often (seconds) the background poller runs enabled plugins' `poll`
     # while devmux is attached, and how often it wakes to check attachment (so a
     # reattach kicks off a poll within a couple seconds rather than up to POLL_SECONDS).
@@ -803,6 +809,7 @@ module Devmux
       start_bind_enforcer
       start_plugin_updater
       start_bg_supervisor
+      start_worktree_tracker
       # Backstop: kill any plugin background processes if the manager exits cleanly
       # (the per-process watchdog covers hard kills / tmux kill-server).
       at_exit { stop_all_actions }
@@ -1327,7 +1334,8 @@ module Devmux
     # whether that's an agent writing its own context (registry), a plugin poll
     # caching state (plugin store), or the bind enforcer flipping ok/broken.
     def state_mtime
-      files = [@state_file, @bind_file, @bg_file, File.join(TmuxSession.state_dir, "groups.json")] +
+      files = [@state_file, @bind_file, @bg_file, Devmux::Worktrees.store_path,
+               File.join(TmuxSession.state_dir, "groups.json")] +
               Dir.glob(File.join(TmuxSession.state_dir, "plugin-*.json")) +
               Dir.glob(File.join(TmuxSession.state_dir, "show-*.json"))
       files.map { |f| File.mtime(f) rescue nil }.compact.max
@@ -1656,6 +1664,46 @@ module Devmux
           sleep ATTACH_CHECK_SECONDS
         end
       end
+    end
+
+    # Background thread that records each session worktree's HEAD sha into the
+    # Worktrees store, so plugins can compare against it without running git. Uses
+    # the backend git helper (--no-optional-locks); writes only on change (so the
+    # store's mtime — watched by state_mtime — bumps only when something actually
+    # moved, driving a live sidebar refresh). Runs while attached, like the poller.
+    def start_worktree_tracker
+      @worktree_tracker = Thread.new do
+        loop do
+          begin
+            track_worktrees if tmux_attached?
+          rescue StandardError => e
+            TmuxSession.log_error("worktree-tracker", e)
+          end
+          sleep WORKTREE_TRACK_SECONDS
+        end
+      end
+    end
+
+    def track_worktrees
+      current = {}
+      @registry.agents.each do |a|
+        worktree = ((a["context"] || {})["worktree"]).to_s
+        next if worktree.empty? || current.key?(worktree)
+        sha = git(worktree, "rev-parse", "HEAD")
+        current[worktree] = sha if sha && !sha.empty?
+      end
+      return if current == Devmux::Worktrees.all
+      write_worktrees(current)
+    end
+
+    def write_worktrees(map)
+      path = Devmux::Worktrees.store_path
+      FileUtils.mkdir_p(File.dirname(path))
+      tmp = "#{path}.tmp"
+      File.write(tmp, JSON.pretty_generate(map))
+      File.rename(tmp, path)
+    rescue StandardError => e
+      TmuxSession.log_error("worktree-write", e)
     end
 
     def tmux_attached?
