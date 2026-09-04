@@ -32,6 +32,9 @@ module Devmux
   #   actions(context)         -> [ { id:, label:, active_label:, command:[argv],
   #                                   icon:, name: } ] command actions for the
   #                                "m" menu; a background (long-running) toggle.
+  #   action_indicator(id, ctx)-> { icon:, name:, color: } live indicator for a
+  #                                running action (overrides the one captured at
+  #                                start), so the title can reflect changing state.
   #
   # Enabled/disabled state persists as JSON under the state dir, read fresh on
   # every query (never cached): the plugins menu runs in a separate process (a
@@ -238,6 +241,18 @@ module Devmux
       end
     rescue StandardError
       []
+    end
+
+    # A live indicator ({ icon:, name:, color: }) for a running action from its
+    # owning plugin, or nil — lets the running-process title reflect changing state
+    # (e.g. the beta's current deployed SHA) rather than the value captured when it
+    # started.
+    def action_indicator(plugin_id, action_id, context)
+      plugin = find(plugin_id)
+      return nil unless plugin && plugin.respond_to?(:action_indicator)
+      plugin.action_indicator(action_id, context)
+    rescue StandardError
+      nil
     end
 
     # Run one poll cycle: every enabled pollable plugin's `poll`, handed a

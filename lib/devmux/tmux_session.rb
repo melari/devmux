@@ -1684,13 +1684,20 @@ module Devmux
     end
 
     # The @devmux_bg title marker: each running background process's icon + name in
-    # the attention color, or "" when none. Re-expanded in pane-border-format.
+    # its color, or "" when none. Re-expanded in pane-border-format. The plugin may
+    # override the icon/name/color live via action_indicator (e.g. beta appends the
+    # current deployed SHA), so the title reflects changing state; falls back to the
+    # values captured when the process started.
     def bg_title_marker(record)
-      indicators = bg_indicators(record["uuid"])
-      return "" if indicators.empty?
-      indicators.map do |i|
-        tmux = TmuxSession.tmux_color(i[:color] || BG_COLOR)
-        "#[fg=#{tmux}]#{i[:icon]} #{i[:name]}"
+      procs = @bg_mutex.synchronize { @bg_procs.values.select { |e| e[:uuid] == record["uuid"] } }
+      return "" if procs.empty?
+      ctx = record["context"] || {}
+      procs.map do |e|
+        live = Plugins.action_indicator(e[:plugin_id], e[:action_id], ctx)
+        icon = (live && live[:icon]) || e[:icon]
+        name = (live && live[:name]) || e[:indicator]
+        tmux = TmuxSession.tmux_color((live && live[:color]) || e[:color] || BG_COLOR)
+        "#[fg=#{tmux}]#{icon} #{name}"
       end.join(" ") + "  "
     end
 
