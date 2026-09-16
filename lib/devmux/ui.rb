@@ -225,8 +225,7 @@ module Devmux
       when " "           then select_pane
       when "a"        then archive_selected
       when "d"        then show_diff_selected
-      when "n"        then @backend.new_agent
-      when "N"        then @backend.new_agent_pick
+      when "n"        then @backend.new_agent_pick
       when "p"        then open_pr
       when "t"        then open_ticket
       when "v"        then open_editor_selected
@@ -1100,7 +1099,7 @@ module Devmux
       else
         items << "[↵] toggle"
       end
-      items << "[n] new" << "[N] new in project" << "[z] settings"
+      items << "[n] new" << "[z] settings"
       items << "[?] hide help" << "[q] quit"
       items
     end

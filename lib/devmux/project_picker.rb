@@ -5,10 +5,11 @@ require "devmux/projects"
 require "devmux/icons"
 
 module Devmux
-  # The project picker: a small modal TUI launched in a centered tmux popup (see
-  # UI's "N" key) listing the known projects (Devmux::Projects.list). Type to
-  # filter, j/k or the arrows move, Enter picks the highlighted project (or, when
-  # nothing matches, the typed path if it's a directory), Esc/Ctrl-c cancel.
+  # The project picker: a small modal TUI launched in a centered tmux popup (the
+  # "n" key — new session) listing the known projects (Devmux::Projects.list) with
+  # the default floated to the top. Type to filter, j/k or the arrows move, Enter
+  # picks the highlighted project (or, when nothing matches, the typed path if it's
+  # a directory), Esc/Ctrl-c cancel.
   #
   # It's its own process, so it can't spawn the agent itself (that needs the
   # manager driving tmux); instead it writes the chosen path to the handoff file
@@ -18,9 +19,18 @@ module Devmux
     VISIBLE = 12
 
     def initialize
-      @all = Projects.list
+      @all = ordered_projects
       @filter = +""
       @sel = 0
+    end
+
+    # The known projects with the default (what `n` used to open silently) floated
+    # to the top, so it's the first, pre-selected choice.
+    def ordered_projects
+      list = Projects.list
+      default = Projects.default
+      return list unless default && list.include?(default)
+      [default] + (list - [default])
     end
 
     def run
