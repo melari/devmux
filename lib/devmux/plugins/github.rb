@@ -225,8 +225,13 @@ module Devmux
         state = "draft" if state == "open" && node["isDraft"]
         queue = node["mergeQueueEntry"]
         state = "queued" if state == "open" && queue
+        # `mergeable` is only meaningful while the PR can still be merged; GitHub
+        # leaves it as CONFLICTING on merged/closed PRs (notably after a stacked
+        # merge), so only treat it as a conflict for an open-ish PR — otherwise a
+        # merged PR would render with the yellow conflict icon instead of merged.
+        conflict = %w[open draft queued].include?(state) && node["mergeable"] == "CONFLICTING"
         { id: id, title: node["title"].to_s, state: state, ci: ci_state(node),
-          conflict: node["mergeable"] == "CONFLICTING",
+          conflict: conflict,
           eta: queue && queue["estimatedTimeToMerge"] }
       end
 
