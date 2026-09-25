@@ -67,6 +67,7 @@ module Devmux
       @highlighted = :unset # sentinel so the first update_highlight always applies
       @focused = :unset     # sentinel so the first sync_drawer always applies
       @published_hover = nil # sentinel so the first publish_hover always applies
+      @published_width = nil # sentinel so the first publish_width always applies
       @expanded = Set.new   # session names shown as a resource tree
       @rename_buf = nil     # non-nil while the rename prompt is active
       @hints_expanded = false # key hints hidden until toggled with "?"
@@ -124,6 +125,7 @@ module Devmux
             select_on_expand if became_focused
             update_highlight(focused)
             publish_hover
+            publish_width
             expire_flash
             @mtime = @backend.state_mtime
           rescue StandardError => e
@@ -330,7 +332,7 @@ module Devmux
     def move_selected(delta)
       agent = selected_agent
       return unless agent
-      @backend.move_agent(agent[:name], delta)
+      @backend.move_agent(agent[:name], delta, skip: @collapsed_groups.to_a)
       refresh
       idx = @rows.index { |r| r[:type] == :agent && r[:agent][:name] == agent[:name] }
       @sel = idx if idx
@@ -595,7 +597,7 @@ module Devmux
     def sync_drawer(focused)
       return if focused == @focused
       @focused = focused
-      focused ? @backend.expand_drawer : @backend.collapse_drawer
+      focused ? @backend.expand_drawer(content_width) : @backend.collapse_drawer
     end
 
     # On expand, hover the entry for the agent that was focused (recorded by
@@ -616,6 +618,44 @@ module Devmux
       return if name == @published_hover
       @published_hover = name
       @backend.publish_hover(name)
+    end
+
+    def publish_width
+      width = content_width
+      return if width == @published_width
+      @published_width = width
+      @backend.publish_width(width)
+      @backend.expand_drawer(width) if @focused == true
+    end
+
+    CONTENT_PADDING = 3
+    def content_width
+      widths = @rows.map { |row| row_width(row) }
+      widths << HINT_WIDTH
+      widths.concat(hint_items.map { |item| item.length + 2 }) if @hints_expanded
+      widths.max + CONTENT_PADDING
+    end
+
+    HINT_WIDTH = 11
+
+    def row_width(row)
+      case row[:type]
+      when :group_header then row[:group][:name].to_s.length + 2
+      when :agent
+        a = row[:agent]
+        assoc = !@expanded.include?(a[:name])
+        icons = assoc ? row_icons_cols(a) : 4
+        anns = assoc ? annotations_cols(a) : 0
+        4 + icons + anns + label_of(a).length + bind_cols(a) + bg_cols(a)
+      when :branch then 5 + (Icons.nerd? ? 2 : 0) + row[:branch].to_s.length
+      when :resource
+        res = row[:resource]
+        annotation = res[:annotation].to_s
+        5 + (res[:icons].size * 2) + (annotation.empty? ? 0 : annotation.length + 1) + res[:label].to_s.length
+      when :archive_header then "▸ Archived (#{row[:count]})".length
+      when :more then "     … show more (#{row[:remaining]})".length
+      else 0
+      end
     end
 
     # Tell the backend which agent pane to highlight (blue border + title): the

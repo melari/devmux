@@ -808,8 +808,8 @@ module Devmux
     # grouped order, crossing group boundaries at the edges (which reassigns its
     # group). The group order handed to the registry includes the implicit unnamed
     # group "" at the front.
-    def move_agent(name, delta)
-      @registry.move(name, delta, [""] + Groups.ids)
+    def move_agent(name, delta, skip: [])
+      @registry.move(name, delta, [""] + Groups.ids, skip: skip)
     end
 
     # Create a brand-new agent (fresh Claude session) and drop into it — you make
@@ -926,8 +926,8 @@ module Devmux
 
     # Widen the drawer to the expanded width and re-even the agents. Called when
     # the drawer gains focus (by any means), so its size always tracks focus.
-    def expand_drawer
-      TmuxSession.set_layout(@tmux, TmuxSession::EXPANDED_WIDTH)
+    def expand_drawer(content_width)
+      Drawer.expand(@tmux, content_width)
     end
 
     # Shrink the drawer to the collapsed width and re-even the agents. Called when
@@ -1273,6 +1273,10 @@ module Devmux
     # its pane (see toggle!). "" when nothing agent-like is selected.
     def publish_hover(name)
       @tmux.set_option(TmuxSession::HOVER_OPTION, name.to_s)
+    end
+
+    def publish_width(width)
+      @tmux.set_option(Drawer::WIDTH_OPTION, width.to_s)
     end
 
     # Read (and clear) the agent that toggle! asked the sidebar to select on

@@ -64,8 +64,9 @@ module Devmux
     # implicit unnamed group "" at the front. Within a group it swaps with its
     # neighbour; at a group's edge it crosses into the adjacent group (becoming
     # that group's first/last member) — which is how a session changes group.
+    # Groups in `skip` (collapsed in the sidebar) are stepped over, never entered.
     # No-op at the very top/bottom. All position math happens here under the mutex.
-    def move(name, delta, group_ids)
+    def move(name, delta, group_ids, skip: [])
       @mutex.synchronize do
         data = load
         rec = by_name(data, name)
@@ -75,9 +76,9 @@ module Devmux
         peers = active.select { |a| group_of(a, group_ids) == cur }
         idx = peers.index(rec)
         if delta.positive?
-          idx < peers.size - 1 ? swap_positions(data, rec, peers[idx + 1]) : cross_group(data, rec, cur, group_ids, +1)
+          idx < peers.size - 1 ? swap_positions(data, rec, peers[idx + 1]) : cross_group(data, rec, cur, group_ids, +1, skip)
         else
-          idx.positive? ? swap_positions(data, rec, peers[idx - 1]) : cross_group(data, rec, cur, group_ids, -1)
+          idx.positive? ? swap_positions(data, rec, peers[idx - 1]) : cross_group(data, rec, cur, group_ids, -1, skip)
         end
         save(data)
       end
@@ -153,10 +154,12 @@ module Devmux
 
     # Move `rec` into the adjacent group (dir +1 down / -1 up), reassigning its
     # group and repositioning it so it renders first (moving down) or last (moving
-    # up) of that group. No-op past the first/last group.
-    def cross_group(data, rec, cur, group_ids, dir)
+    # up) of that group, passing over any `skip` groups. No-op past the
+    # first/last group.
+    def cross_group(data, rec, cur, group_ids, dir, skip = [])
       ci = group_ids.index(cur)
       ti = ci && ci + dir
+      ti += dir while ti && ti.between?(0, group_ids.size - 1) && skip.include?(group_ids[ti])
       return if ti.nil? || ti.negative? || ti >= group_ids.size
       target = group_ids[ti]
       target.empty? ? rec.delete("group") : rec["group"] = target

@@ -11,10 +11,14 @@ module Devmux
     #                   so the UI can move its selection to that entry.
     HOVER_OPTION = "@devmux_hover".freeze
     SELECT_OPTION = "@devmux_select".freeze
+    WIDTH_OPTION = "@devmux_width".freeze
 
     # Drawer widths in columns. Collapsed sits below UI::COMPACT_MAX_COLS so the
-    # sidebar renders its compact view; expanded sits above it.
+    # sidebar renders its compact view; expanded sits above it, sized to the UI's
+    # published content width (WIDTH_OPTION) within MIN_EXPANDED_WIDTH and half
+    # the window, falling back to EXPANDED_WIDTH when none is published.
     COLLAPSED_WIDTH = 16
+    MIN_EXPANDED_WIDTH = 24
     EXPANDED_WIDTH = 44
 
     module_function
@@ -32,10 +36,11 @@ module Devmux
       manager = panes.find { |p| p[:title] == MANAGER_TITLE }
       return unless manager
 
-      if manager[:width] <= (COLLAPSED_WIDTH + EXPANDED_WIDTH) / 2
+      if manager[:width] <= (COLLAPSED_WIDTH + MIN_EXPANDED_WIDTH) / 2
         active = panes.find { |p| p[:active] }
         select = ["set-option", "-t", Tmux::SESSION, SELECT_OPTION, (active && active[:agent]) || ""]
-        tmux.batch([select] + layout_commands(panes, EXPANDED_WIDTH) + [["select-pane", "-t", manager[:id]]])
+        width = expanded_width(panes, tmux.get_option(WIDTH_OPTION).to_i)
+        tmux.batch([select] + layout_commands(panes, width) + [["select-pane", "-t", manager[:id]]])
       else
         hovered = tmux.get_option(HOVER_OPTION)
         pane = hovered.to_s.empty? ? nil : panes.find { |p| p[:agent] == hovered }
@@ -60,6 +65,17 @@ module Devmux
     # every expand/collapse.
     def set_layout(tmux, manager_width)
       tmux.batch(layout_commands(tmux.panes, manager_width))
+    end
+
+    def expand(tmux, content_width)
+      panes = tmux.panes
+      tmux.batch(layout_commands(panes, expanded_width(panes, content_width)))
+    end
+
+    def expanded_width(panes, content_width)
+      return EXPANDED_WIDTH unless content_width.positive?
+      max = panes.first ? panes.first[:window_width] / 2 : content_width
+      content_width.clamp(MIN_EXPANDED_WIDTH, [max, MIN_EXPANDED_WIDTH].max)
     end
 
     def layout_commands(panes, manager_width)
