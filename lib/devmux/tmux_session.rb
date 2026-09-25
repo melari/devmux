@@ -2,8 +2,10 @@ require "fileutils"
 require "shellwords"
 require "digest"
 require "json"
+require "set"
 require "io/console"
 require "devmux/tmux"
+require "devmux/drawer"
 require "devmux/registry"
 require "devmux/plugins"
 require "devmux/plugin_host"
@@ -16,11 +18,11 @@ module Devmux
   # Three entry contexts share this module:
   #   - launch!  runs OUTSIDE tmux (a bare `devmux`): create-or-attach the session.
   #   - the manager UI runs INSIDE the manager pane and drives TmuxBackend.
-  #   - toggle!  runs from the global Ctrl-Space keybind (a fresh process, no
+  #   - Drawer.toggle! runs from the global Ctrl-Space keybind (a fresh process, no
   #     shared state) and resizes/focuses the drawer purely from queried state.
   module TmuxSession
     SESSION = Tmux::SESSION
-    MANAGER_TITLE = "devmux-manager".freeze
+    MANAGER_TITLE = Drawer::MANAGER_TITLE
     FOCUS_KEY = "C-Space".freeze
     # tmux session option recording the devmux source stamp the session was
     # created from, so a relaunch can detect an update.
@@ -28,19 +30,10 @@ module Devmux
     # tmux session option recording the directory devmux was last launched from,
     # so new agents open there — not in devmux's own dir or a stale session's dir.
     LAUNCH_DIR_OPTION = "@devmux_launch_dir".freeze
-    # Session options coupling the sidebar selection and pane focus across the
-    # Ctrl-Space toggle (which runs in a separate process from the UI):
-    #   HOVER_OPTION  — the UI publishes the currently-selected agent's name here,
-    #                   so collapsing focuses that agent's pane.
-    #   SELECT_OPTION — on expand, toggle! records the agent that was focused here,
-    #                   so the UI can move its selection to that entry.
-    HOVER_OPTION = "@devmux_hover".freeze
-    SELECT_OPTION = "@devmux_select".freeze
-
-    # Drawer widths in columns. Collapsed sits below UI::COMPACT_MAX_COLS so the
-    # sidebar renders its compact view; expanded sits above it.
-    COLLAPSED_WIDTH = 16
-    EXPANDED_WIDTH = 44
+    HOVER_OPTION = Drawer::HOVER_OPTION
+    SELECT_OPTION = Drawer::SELECT_OPTION
+    COLLAPSED_WIDTH = Drawer::COLLAPSED_WIDTH
+    EXPANDED_WIDTH = Drawer::EXPANDED_WIDTH
 
     module_function
 
@@ -367,67 +360,12 @@ module Devmux
       [200, 50]
     end
 
-    # Global Ctrl-Space handler, invoked as a standalone process by the keybind.
-    # It reads the manager's current width to decide direction. The sidebar
-    # selection and pane focus stay coupled via two session options (see
-    # HOVER_OPTION / SELECT_OPTION):
-    #   - Expanding records the agent that was focused (SELECT_OPTION) so the UI
-    #     hovers its entry, then focuses the manager.
-    #   - Collapsing focuses the pane of the currently-hovered entry (HOVER_OPTION),
-    #     falling back to the last-active pane when it has none.
-    def toggle!
-      tmux = Tmux.new
-      panes = tmux.panes
-      manager = panes.find { |p| p[:title] == MANAGER_TITLE }
-      return unless manager
-
-      if manager[:width] <= (COLLAPSED_WIDTH + EXPANDED_WIDTH) / 2
-        active = panes.find { |p| p[:active] }
-        tmux.set_option(SELECT_OPTION, (active && active[:agent]) || "")
-        set_layout(tmux, EXPANDED_WIDTH)
-        tmux.focus(manager[:id])
-      else
-        hovered = tmux.get_option(HOVER_OPTION)
-        pane = hovered.to_s.empty? ? nil : panes.find { |p| p[:agent] == hovered }
-        set_layout(tmux, COLLAPSED_WIDTH)
-        pane ? tmux.focus(pane[:id]) : tmux.focus_last
-      end
-    end
-
-    # Give every agent pane an equal share of the width left over after the
-    # manager: set each agent (bar the last, which absorbs the rounding
-    # remainder) to `each` columns, left to right.
     def rebalance_agents(tmux)
-      panes = tmux.panes
-      manager = panes.find { |p| p[:title] == MANAGER_TITLE }
-      return unless manager
-      tmux.batch(agent_resize_commands(tmux, panes, manager[:width]))
+      Drawer.rebalance_agents(tmux)
     end
 
-    # Resize the manager drawer to `manager_width` AND re-even the agents to the
-    # width left over — all in ONE tmux invocation, so tmux reflows and redraws
-    # once instead of flickering the agent panes through intermediate widths on
-    # every expand/collapse.
     def set_layout(tmux, manager_width)
-      panes = tmux.panes
-      manager = panes.find { |p| p[:title] == MANAGER_TITLE }
-      return unless manager
-      commands = [["resize-pane", "-t", manager[:id], "-x", manager_width.to_s]]
-      commands.concat(agent_resize_commands(tmux, panes, manager_width))
-      tmux.batch(commands)
-    end
-
-    # The resize commands (arg arrays) that even out the agent columns for a given
-    # manager width. Only real agent panes (@devmux_agent) count — a vim "show"
-    # pane shares its agent's column, so resizing the agent resizes it too.
-    def agent_resize_commands(tmux, panes, manager_width)
-      agents = panes.select { |p| p[:agent] }
-      return [] if agents.empty?
-      count = agents.size
-      avail = tmux.window_width - manager_width - count
-      each = avail / count
-      return [] if each < 1
-      agents[0...-1].map { |a| ["resize-pane", "-t", a[:id], "-x", each.to_s] }
+      Drawer.set_layout(tmux, manager_width)
     end
 
     # Default agent program. Overridable per-launch via DEVMUX_AGENT (assumed
@@ -650,7 +588,7 @@ module Devmux
         set -g window-style dim,bg=colour236
         set -g window-active-style nodim,bg=terminal
 
-        bind -n #{FOCUS_KEY} run-shell "#{exe_path.shellescape} tmux-toggle"
+        bind -n #{FOCUS_KEY} run-shell "RUBYOPT=--disable-gems #{exe_path.shellescape} tmux-toggle"
 
         # Ctrl-w navigates panes — but if the focused pane is running vim/nvim,
         # forward C-w to it instead so vim's own window commands (C-w h/j/k/l)
@@ -767,9 +705,11 @@ module Devmux
     BG_SUPERVISE_SECONDS = 1
 
     # How often (seconds) the manager refreshes each session worktree's HEAD sha
-    # into the Worktrees store (for plugins). Frequent + --no-optional-locks so
-    # it's responsive without contending with agents' git.
+    # into the Worktrees store (for plugins). Read from the git files directly (no
+    # git process), so it's cheap to do for every session this often.
     WORKTREE_TRACK_SECONDS = 1
+
+    DIRTY_TRACK_SECONDS = 10
 
     # How often (seconds) the background poller runs enabled plugins' `poll`
     # while devmux is attached, and how often it wakes to check attachment (so a
@@ -851,6 +791,8 @@ module Devmux
       record = @registry.record(name)
       dir = ((record && record["context"]) || {})["worktree"].to_s
       return nil if dir.empty?
+      head = Devmux::Worktrees.head(dir)
+      return head["branch"] || head["sha"][0, 7] if head
       ref = git(dir, "symbolic-ref", "--quiet", "--short", "HEAD")
       return ref if ref && !ref.empty?
       git(dir, "rev-parse", "--short", "HEAD")
@@ -968,18 +910,18 @@ module Devmux
     # border + title bar, clearing the highlight on every other agent pane. Pass
     # nil to clear all (e.g. when the drawer is collapsed). Best-effort repaint.
     def highlight(name)
-      shown_panes.each do |pane_name, pane_id|
-        @tmux.set_pane_option(pane_id, HL_OPTION, pane_name == name ? "1" : "")
-      end
+      @tmux.batch(shown_panes.map do |pane_name, pane_id|
+        ["set-option", "-p", "-t", pane_id, HL_OPTION, pane_name == name ? "1" : ""]
+      end)
       @tmux.refresh_client
     end
 
-    # Is the manager drawer the active (focused) pane? Used to gate the hover
-    # highlight so it only shows while you're actually navigating the sidebar.
-    def manager_focused?
-      @tmux.active_pane == @manager_id
+    def pane_state
+      panes = @tmux.panes
+      { focused: panes.any? { |p| p[:active] && p[:id] == @manager_id },
+        shown: panes.filter_map { |p| p[:agent] } }
     rescue StandardError
-      true
+      { focused: true, shown: nil }
     end
 
     # Widen the drawer to the expanded width and re-even the agents. Called when
@@ -1440,7 +1382,7 @@ module Devmux
     # uncommitted changes the commit checkout doesn't capture; else "ok".
     def bind_status(worktree)
       return "broken" unless apply_bind(worktree)
-      worktree_dirty?(worktree) ? "dirty" : "ok"
+      Devmux::Worktrees.dirty?(worktree) ? "dirty" : "ok"
     end
 
     def worktree_dirty?(worktree)
@@ -1699,8 +1641,9 @@ module Devmux
     end
 
     # Background thread that records each session worktree's HEAD sha into the
-    # Worktrees store, so plugins can compare against it without running git. Uses
-    # the backend git helper (--no-optional-locks); writes only on change (so the
+    # Worktrees store, so plugins can compare against it without running git. The
+    # sha comes from the git files; the dirty flag from `git status` for open
+    # sessions only (see DIRTY_TRACK_SECONDS). Writes only on change (so the
     # store's mtime — watched by state_mtime — bumps only when something actually
     # moved, driving a live sidebar refresh). Runs while attached, like the poller.
     def start_worktree_tracker
@@ -1717,16 +1660,49 @@ module Devmux
     end
 
     def track_worktrees
+      previous = Devmux::Worktrees.all
+      agents = @registry.agents
+      live = dirty_tracked_worktrees(agents)
       current = {}
-      @registry.agents.each do |a|
+      agents.each do |a|
         worktree = ((a["context"] || {})["worktree"]).to_s
         next if worktree.empty? || current.key?(worktree)
-        sha = git(worktree, "rev-parse", "HEAD")
+        sha = worktree_sha(worktree)
         next if sha.nil? || sha.empty?
-        current[worktree] = { "sha" => sha, "dirty" => worktree_dirty?(worktree) }
+        prev = previous[worktree] || {}
+        dirty = !!prev["dirty"]
+        dirty = check_dirty(worktree) if live.include?(worktree) && dirty_due?(worktree, prev["sha"] != sha)
+        current[worktree] = { "sha" => sha, "dirty" => dirty }
       end
-      return if current == Devmux::Worktrees.all
+      return if current == previous
       write_worktrees(current)
+    end
+
+    def worktree_sha(worktree)
+      head = Devmux::Worktrees.head(worktree)
+      head ? head["sha"] : git(worktree, "rev-parse", "HEAD")
+    end
+
+    def dirty_tracked_worktrees(agents)
+      shown = shown_panes
+      bound = bind_state["uuid"].to_s
+      agents.select { |a| shown.key?(a["name"]) || (!bound.empty? && a["uuid"] == bound) }
+            .map { |a| ((a["context"] || {})["worktree"]).to_s }
+            .reject(&:empty?).to_set
+    end
+
+    def dirty_due?(worktree, head_moved)
+      last = (@dirty_checked_at ||= {})[worktree]
+      head_moved || last.nil? || monotonic - last >= DIRTY_TRACK_SECONDS
+    end
+
+    def check_dirty(worktree)
+      @dirty_checked_at[worktree] = monotonic
+      worktree_dirty?(worktree)
+    end
+
+    def monotonic
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     def write_worktrees(map)
@@ -1751,15 +1727,14 @@ module Devmux
     def sync_panes
       by_name = @registry.agents.each_with_object({}) { |a, h| h[a["name"]] = a }
       bind = bind_state
-      shown_panes.each do |name, pane_id|
+      commands = shown_panes.flat_map do |name, pane_id|
         record = by_name[name]
-        next unless record
-        @tmux.set_pane_option(pane_id, LABEL_OPTION, TmuxSession.display_label(record))
-        @tmux.set_pane_option(pane_id, BAR_OPTION, agent_state(record))
-        @tmux.set_pane_option(pane_id, ICONS_OPTION, TmuxSession.title_icons(record))
-        @tmux.set_pane_option(pane_id, BIND_OPTION, bind_marker(record, bind))
-        @tmux.set_pane_option(pane_id, BG_OPTION, bg_title_marker(record))
+        next [] unless record
+        { LABEL_OPTION => TmuxSession.display_label(record), BAR_OPTION => agent_state(record),
+          ICONS_OPTION => TmuxSession.title_icons(record), BIND_OPTION => bind_marker(record, bind),
+          BG_OPTION => bg_title_marker(record) }.map { |opt, value| ["set-option", "-p", "-t", pane_id, opt, value] }
       end
+      @tmux.batch(commands)
       # Repaint now so the new colors show immediately, not on tmux's next tick.
       @tmux.refresh_client
     end

@@ -14,7 +14,7 @@ module Devmux
     # format string (escaped so Ruby doesn't interpolate it). The trailing
     # @devmux_agent is our own pane user-option — a stable identity that the
     # program in the pane can't overwrite the way it can the title.
-    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}\t\#{@devmux_diff}\t\#{@devmux_console}".freeze
+    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}\t\#{@devmux_diff}\t\#{@devmux_console}\t\#{window_width}".freeze
 
     def self.available?
       system("tmux", "-V", out: File::NULL, err: File::NULL)
@@ -40,31 +40,23 @@ module Devmux
     end
 
     # Every pane in the session, left-to-right:
-    # [{ id:, title:, width:, left:, active:, agent: }] — agent is our
+    # [{ id:, title:, width:, left:, active:, agent:, window_width: }] — agent is our
     # @devmux_agent user-option (nil when unset, e.g. the manager pane).
     def panes
       capture("list-panes", "-t", @session, "-F", PANE_FMT).each_line.map do |line|
-        id, title, width, left, active, agent, vim, diff, console = line.chomp.split("\t", -1)
+        id, title, width, left, active, agent, vim, diff, console, window_width = line.chomp.split("\t", -1)
         { id: id, title: title, width: width.to_i, left: left.to_i,
           active: active == "1", agent: (agent.nil? || agent.empty? ? nil : agent),
           vim: (vim.nil? || vim.empty? ? nil : vim),
           diff: (diff.nil? || diff.empty? ? nil : diff),
-          console: (console.nil? || console.empty? ? nil : console) }
+          console: (console.nil? || console.empty? ? nil : console),
+          window_width: window_width.to_i }
       end.sort_by { |p| p[:left] }
     end
 
     # The working directory of a pane (what tmux would use for a new split there).
     def pane_current_path(pane_id)
       capture("display-message", "-p", "-t", pane_id, "\#{pane_current_path}").strip
-    end
-
-    def window_width
-      capture("display-message", "-p", "-t", @session, "\#{window_width}").strip.to_i
-    end
-
-    # The id of the session's currently-active (focused) pane.
-    def active_pane
-      capture("display-message", "-p", "-t", @session, "\#{pane_id}").strip
     end
 
     # Number of clients currently attached to the session (0 when devmux is

@@ -94,8 +94,7 @@ module Devmux
         loop do
           begin
             if input_ready?
-              handle(read_key)
-              refresh
+              handle_pending_keys
               render
             elsif @backend.state_mtime != @mtime
               # State changed on disk with no keypress — e.g. an agent wrote its
@@ -111,8 +110,15 @@ module Devmux
             # Every tick (even idle polls), so a focus change made by any means
             # (Ctrl-Space, a mouse click, another keybind) is reflected promptly:
             # the drawer's size tracks focus (expanded when focused, collapsed
-            # when not) and the hover highlight follows. One focus query, reused.
-            focused = @backend.manager_focused?
+            # when not) and the hover highlight follows. One pane query, reused —
+            # it also catches panes that opened/closed on their own (an agent
+            # exiting, vim quitting) without waiting for a keypress.
+            panes = @backend.pane_state
+            focused = panes[:focused]
+            if shown_changed?(panes[:shown])
+              refresh
+              render
+            end
             became_focused = focused && @focused != true
             sync_drawer(focused)
             select_on_expand if became_focused
@@ -132,15 +138,35 @@ module Devmux
       end
     end
 
-    # True if a keypress is waiting, else false after POLL_INTERVAL so the loop
-    # can check for external state changes.
-    def input_ready?
-      !IO.select([$stdin], nil, nil, POLL_INTERVAL).nil?
+    # True if a keypress is waiting, else false after `timeout` (POLL_INTERVAL by
+    # default) so the loop can check for external state changes.
+    def input_ready?(timeout = POLL_INTERVAL)
+      !IO.select([$stdin], nil, nil, timeout).nil?
     rescue StandardError
       true
     end
 
     private
+
+    NAV_KEYS = ["j", "k", :up, :down, "?", [21].pack("C"), [4].pack("C")].freeze
+
+    def handle_pending_keys
+      fetch = false
+      loop do
+        key = read_key
+        handle(key)
+        fetch ||= !NAV_KEYS.include?(key)
+        break unless input_ready?(0)
+      end
+      refresh if fetch
+    end
+
+    def shown_changed?(pane_agents)
+      return false unless pane_agents
+      known = @agents.map { |a| a[:name] }
+      seen = @agents.select { |a| a[:shown] }.map { |a| a[:name] }
+      (pane_agents & known).sort != seen.sort
+    end
 
     # Pull fresh state from the backend (main loop only — never the signal trap,
     # which must not shell out) and recompute the row layout.
@@ -596,7 +622,7 @@ module Devmux
     # hovered row's, but only in the expanded view and only if it has an open
     # pane. Kept out of #render (which the SIGWINCH trap also calls) since it
     # shells out to tmux; only re-issued when the target changes, to avoid churn.
-    def update_highlight(focused = @backend.manager_focused?)
+    def update_highlight(focused = @backend.pane_state[:focused])
       name = highlighted_name(focused)
       return if name == @highlighted
       @highlighted = name

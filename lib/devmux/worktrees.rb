@@ -42,5 +42,48 @@ module Devmux
       rec = all[path.to_s]
       rec ? !!rec["dirty"] : false
     end
+
+    def head(path)
+      gitdir = git_dir(path.to_s)
+      return nil unless gitdir
+      ref = File.read(File.join(gitdir, "HEAD")).strip
+      return { "sha" => ref, "branch" => nil } unless ref.start_with?("ref: ")
+      name = ref.delete_prefix("ref: ")
+      sha = resolve_ref(gitdir, common_dir(gitdir), name)
+      sha && { "sha" => sha, "branch" => name.delete_prefix("refs/heads/") }
+    rescue StandardError
+      nil
+    end
+
+    def git_dir(path)
+      dotgit = File.join(path, ".git")
+      return dotgit if File.directory?(dotgit)
+      return nil unless File.file?(dotgit)
+      pointer = File.read(dotgit)[/\Agitdir: (.+)$/, 1]
+      pointer && File.expand_path(pointer.strip, path)
+    end
+
+    def common_dir(gitdir)
+      file = File.join(gitdir, "commondir")
+      File.file?(file) ? File.expand_path(File.read(file).strip, gitdir) : gitdir
+    end
+
+    def resolve_ref(gitdir, common, name, depth = 0)
+      return nil if depth > 4
+      [gitdir, common].uniq.each do |dir|
+        loose = File.join(dir, name)
+        next unless File.file?(loose)
+        value = File.read(loose).strip
+        return value unless value.start_with?("ref: ")
+        return resolve_ref(gitdir, common, value.delete_prefix("ref: "), depth + 1)
+      end
+      packed = File.join(common, "packed-refs")
+      return nil unless File.file?(packed)
+      File.foreach(packed) do |line|
+        sha, ref = line.split(" ", 2)
+        return sha if ref && ref.strip == name
+      end
+      nil
+    end
   end
 end

@@ -287,9 +287,13 @@ module Devmux
     end
 
     def disabled
-      return [] unless File.exist?(store_path)
-      data = JSON.parse(File.read(store_path))
-      Array(data["disabled"]).map(&:to_s)
+      stat = File.stat(store_path)
+      key = [stat.mtime, stat.size, stat.ino]
+      cached = @disabled_cache
+      return cached[1].dup if cached && cached[0] == key
+      list = Array(JSON.parse(File.read(store_path))["disabled"]).map(&:to_s).freeze
+      @disabled_cache = [key, list]
+      list.dup
     rescue StandardError
       []
     end

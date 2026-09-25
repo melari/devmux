@@ -1,6 +1,12 @@
 #!/usr/bin/env ruby
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 
+if ARGV == ["tmux-toggle"]
+  require "devmux/drawer"
+  Devmux::Drawer.toggle!
+  exit
+end
+
 require "json"
 require "shellwords"
 require "securerandom"
@@ -224,9 +230,6 @@ when "ui"
   # Invoked as the session's manager pane.
   die "devmux ui must run inside tmux" unless Devmux::TmuxSession.inside_session?
   run_ui
-when "tmux-toggle"
-  # Invoked by the global Ctrl-Space keybind (a fresh process each time).
-  Devmux::TmuxSession.toggle!
 when "plugins-menu"
   # The plugins on/off TUI (kept standalone for debugging; the manager now opens
   # the settings menu, which includes plugins as a category).
