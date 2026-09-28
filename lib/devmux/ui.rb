@@ -843,16 +843,17 @@ module Devmux
       (@groups || []).each { |group| written = compact_group(group, active, written) }
     end
 
-    # Render one group's compact rows (a truncated title line for a named group,
-    # then its members). Empty named groups are omitted in the narrow view.
-    # Returns whether anything has been written, so a blank spacer only goes
-    # between non-empty sections.
+    # Render one group's compact rows (a named group's title line, styled as in
+    # the full view, then its members unless the group is collapsed). Empty named
+    # groups are omitted in the narrow view. Returns whether anything has been
+    # written, so a blank spacer only goes between non-empty sections.
     def compact_group(group, active, written)
       members = active.select { |a| a[:group] == (group && group[:id]) }
       return written if members.empty?
       if group
         $stdout.write("\r\n") if written
-        $stdout.write(truncate(group[:name].to_s, cols) + "\r\n")
+        $stdout.write(group_title(group) + "\r\n")
+        return true if @collapsed_groups.include?(group[:id])
       end
       members.each { |a| $stdout.write(compact_row(a) + "\r\n") }
       true
@@ -975,11 +976,7 @@ module Devmux
           # disclosure arrow (▾ open / ▸ collapsed). Sits flush in the first column
           # (sessions are indented) to set groups apart, and dims when collapsed.
           # Unlike a session's resource tree, group members get no tree connectors.
-          g = row[:group]
-          collapsed = @collapsed_groups.include?(g[:id])
-          arrow = collapsed ? "▸" : "▾"
-          sgr = collapsed ? "2;38;5;39" : "1;38;5;39" # dim vs bold aqua
-          "\e[#{sgr}m#{arrow} #{truncate(g[:name].to_s, cols - 3)}\e[0m"
+          group_title(row[:group])
         when :agent
           a = row[:agent]
           # Archived agents render exactly like any other agent (state-colored
@@ -1018,6 +1015,15 @@ module Devmux
         end
       content = with_selection_bg(content) if selected
       "#{content}\r\n"
+    end
+
+    # A named group's title in aqua, led by its disclosure arrow; shared by the
+    # full and compact views so both show the same collapsed state.
+    def group_title(group)
+      collapsed = @collapsed_groups.include?(group[:id])
+      arrow = collapsed ? "▸" : "▾"
+      sgr = collapsed ? "2;38;5;39" : "1;38;5;39" # dim vs bold aqua
+      "\e[#{sgr}m#{arrow} #{truncate(group[:name].to_s, cols - 3)}\e[0m"
     end
 
     # Progressive-disclosure chevron for a session, in a fixed 2-cell slot so
