@@ -15,6 +15,8 @@ module Devmux
   # from the manager UI, and both mutate this file, so a cached copy would let
   # one clobber the other's writes.
   class Registry
+    class CorruptError < StandardError; end
+
     def initialize(path)
       @path = path
       # Guards read-modify-write against the plugin poller thread mutating the
@@ -48,8 +50,7 @@ module Devmux
     # Stored on the record so it survives hide/show and restarts; nil means "use
     # the default project" (see TmuxBackend#agent_cwd).
     def add(project: nil)
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         rec = { "name" => next_name(data), "uuid" => SecureRandom.uuid,
                 "archived" => false, "context" => {} }
         rec["project"] = project unless project.to_s.empty?
@@ -67,8 +68,7 @@ module Devmux
     # Groups in `skip` (collapsed in the sidebar) are stepped over, never entered.
     # No-op at the very top/bottom. All position math happens here under the mutex.
     def move(name, delta, group_ids, skip: [])
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         rec = by_name(data, name)
         next if rec.nil? || rec["archived"]
         active = data.reject { |a| a["archived"] }
@@ -86,8 +86,7 @@ module Devmux
 
     # Set (or clear, when blank) a session's group id.
     def set_group(name, group_id)
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         rec = by_name(data, name)
         next unless rec
         group_id.to_s.empty? ? rec.delete("group") : rec["group"] = group_id
@@ -96,8 +95,7 @@ module Devmux
     end
 
     def set_archived(name, value)
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         rec = by_name(data, name)
         next unless rec
         rec["archived"] = value
@@ -106,8 +104,7 @@ module Devmux
     end
 
     def delete(name)
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         data.reject! { |a| a["name"] == name }
         save(data)
       end
@@ -125,8 +122,7 @@ module Devmux
     # Write one context key; returns the record (for callers that need its slug)
     # or nil if the session doesn't exist.
     def write_context(id, key, value)
-      @mutex.synchronize do
-        data = load
+      mutate do |data|
         rec = by_id(data, id)
         next nil unless rec
         (rec["context"] ||= {})[key] = value
@@ -192,23 +188,52 @@ module Devmux
       "agent-#{(used.max || 0) + 1}"
     end
 
+    def mutate
+      @mutex.synchronize do
+        FileUtils.mkdir_p(File.dirname(@path))
+        File.open("#{@path}.lock", File::RDWR | File::CREAT, 0o644) do |lock|
+          lock.flock(File::LOCK_EX)
+          yield load
+        end
+      end
+    end
+
     def load
-      return [] unless File.exist?(@path)
-      data = JSON.parse(File.read(@path))
-      data.is_a?(Array) ? data : []
-    rescue StandardError
-      []
+      return [] unless File.exist?(@path) || File.exist?(backup_path)
+      parse(@path) || parse(backup_path) ||
+        raise(CorruptError, "#{@path} and #{backup_path} are unreadable; refusing to treat them as empty")
+    end
+
+    def parse(path)
+      data = JSON.parse(File.read(path))
+      data if data.is_a?(Array)
+    rescue SystemCallError, JSON::ParserError
+      nil
+    end
+
+    def backup_path
+      "#{@path}.bak"
     end
 
     # Persist atomically (temp + rename) so a concurrent reader — the poller
     # thread, or the separate `devmux context` process — never sees a torn file.
-    # Deliberately NOT rescued: a failed write (e.g. a sandboxed agent that can't
-    # write the state dir) must surface, not silently no-op.
+    # Callers hold the cross-process lock (see #mutate); the temp name is still
+    # unique per writer, and the last good file is kept as a backup that #load
+    # falls back to. Deliberately NOT rescued: a failed write (e.g. a sandboxed
+    # agent that can't write the state dir) must surface, not silently no-op.
     def save(data)
-      FileUtils.mkdir_p(File.dirname(@path))
-      tmp = "#{@path}.tmp"
-      File.write(tmp, JSON.pretty_generate(data))
+      tmp = "#{@path}.#{Process.pid}.#{SecureRandom.hex(4)}.tmp"
+      File.open(tmp, "w") do |f|
+        f.write(JSON.pretty_generate(data))
+        f.fsync
+      end
+      if parse(@path)
+        File.link(@path, "#{tmp}.bak")
+        File.rename("#{tmp}.bak", backup_path)
+      end
       File.rename(tmp, @path)
+    ensure
+      [tmp, "#{tmp}.bak"].each { |f| File.unlink(f) if f && File.exist?(f) }
     end
   end
 end
