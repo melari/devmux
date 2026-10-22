@@ -42,8 +42,11 @@ module Devmux
       # Glyph + color for a PR with merge conflicts — replaces the normal PR glyph.
       CONFLICT_ICON = { glyph: "\u{ec6e}", color: "38;5;220" }.freeze # yellow
 
+      APPROVALS_NEEDED = 2
+
       PR_FIELDS =
         "title state isDraft mergeable url " \
+        "latestOpinionatedReviews(first: 100) { nodes { state } } " \
         "mergeQueueEntry { estimatedTimeToMerge } " \
         "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
 
@@ -113,8 +116,7 @@ module Devmux
             { state: rec["state"], color: STATE_COLORS[rec["state"]] }
           end
         details[:title] = rec["title"] unless rec["title"].to_s.empty?
-        ci = CI_ICONS[rec["ci"]]
-        details[:icons] = [ci] if ci
+        details[:icons] = [CI_ICONS[rec["ci"]], approval_icon(rec["approvals"])].compact
         details
       end
 
@@ -144,9 +146,16 @@ module Devmux
         @store.read["resources"] || {}
       end
 
+      def approval_icon(count)
+        return nil unless count.is_a?(Integer)
+        glyph = [0xF0C9F + (2 * count.clamp(0, 9))].pack("U")
+        color = count >= APPROVALS_NEEDED ? "38;5;40" : "38;5;240"
+        { glyph: glyph, color: color }
+      end
+
       def store_rec(pr)
         { "state" => pr[:state], "ci" => pr[:ci], "conflict" => pr[:conflict],
-          "title" => pr[:title], "eta" => pr[:eta] }
+          "title" => pr[:title], "eta" => pr[:eta], "approvals" => pr[:approvals] }
       end
 
       # A compact per-state count for the log line, e.g. "open=1 merged=2".
@@ -231,7 +240,7 @@ module Devmux
         # merged PR would render with the yellow conflict icon instead of merged.
         conflict = %w[open draft queued].include?(state) && node["mergeable"] == "CONFLICTING"
         { id: id, title: node["title"].to_s, state: state, ci: ci_state(node),
-          conflict: conflict,
+          conflict: conflict, approvals: approval_count(node),
           eta: queue && queue["estimatedTimeToMerge"] }
       end
 
@@ -244,6 +253,10 @@ module Devmux
         when "FAILURE", "ERROR" then "failing"
         when "PENDING", "EXPECTED" then "pending"
         end
+      end
+
+      def approval_count(node)
+        Array(node.dig("latestOpinionatedReviews", "nodes")).count { |r| r["state"] == "APPROVED" }
       end
 
       def pr_identifier(url)
