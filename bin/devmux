@@ -199,6 +199,62 @@ def plugins_log
   puts File.read(path)
 end
 
+def find_group(name)
+  return nil if name.nil?
+  Devmux::Groups.all.find { |g| g[:name].strip.casecmp?(name.strip) } ||
+    die("no such group: #{name} (have: #{Devmux::Groups.all.map { |g| g[:name] }.join(', ')})")
+end
+
+def session_json(rec)
+  ctx = rec["context"] || {}
+  { "name" => rec["name"], "uuid" => rec["uuid"], "title" => ctx["name"],
+    "group" => Devmux::Groups.name(rec["group"].to_s), "archived" => !!rec["archived"],
+    "prs" => Array(ctx["prs"]), "tickets" => Array(ctx["tickets"]) }
+end
+
+def sessions_list(args)
+  group = find_group(flag_value(args, "--group"))
+  recs = registry.agents.reject { |r| r["archived"] }
+  recs = recs.select { |r| r["group"].to_s == group[:id] } if group
+  puts JSON.pretty_generate(recs.map { |r| session_json(r) })
+end
+
+def sessions_new(args)
+  group = find_group(flag_value(args, "--group"))
+  title = flag_value(args, "--title")
+  prs = flag_values(args, "--pr")
+  project = flag_value(args, "--project")
+  die "invalid PR id: #{prs.reject { |id| Devmux::Providers.valid?(id) }.join(', ')}" unless prs.all? { |id| Devmux::Providers.valid?(id) }
+  rec = registry.add(project: project)
+  registry.set_group(rec["name"], group[:id]) if group
+  registry.write_context(rec["uuid"], "name", title) if title
+  registry.write_context(rec["uuid"], "prs", prs) unless prs.empty?
+  puts JSON.pretty_generate(session_json(registry.record(rec["uuid"])))
+end
+
+def sessions_archive(id)
+  rec = registry.record(id)
+  die "no such session: #{id}" unless rec
+  tmux = Devmux::Tmux.new
+  if tmux.has_session?
+    name = rec["name"]
+    panes = tmux.panes.select { |p| [p[:agent], p[:vim], p[:console]].include?(name) }
+    hidden = tmux.stashed_panes.select { |p| p[:agent] == name }
+    (panes + hidden).each { |p| tmux.close(p[:id]) rescue nil }
+    Devmux::Drawer.rebalance_agents(tmux) unless panes.empty?
+  end
+  registry.set_archived(rec["name"], true)
+  puts JSON.pretty_generate(session_json(registry.record(rec["uuid"])))
+end
+
+def flag_value(args, flag)
+  flag_values(args, flag).last
+end
+
+def flag_values(args, flag)
+  args.each_cons(2).filter_map { |key, value| value if key == flag }
+end
+
 def refresh_label(record)
   tmux = Devmux::Tmux.new
   return unless tmux.has_session?
@@ -242,6 +298,14 @@ when "project-picker"
   # Invoked inside a tmux popup by the manager's "N" key: pick a project for a
   # new agent. Writes its choice to the handoff file the manager reads back.
   Devmux::ProjectPicker.new.run
+when "sessions"
+  sub = ARGV.shift
+  case sub
+  when "list"    then sessions_list(ARGV)
+  when "new"     then sessions_new(ARGV)
+  when "archive" then sessions_archive(ARGV.shift || die("usage: devmux sessions archive <session_id>"))
+  else die "usage: devmux sessions list|new|archive ..."
+  end
 when "open"
   # Open a resource identifier's URL in the browser (used by click-to-open and
   # available from a shell).
@@ -283,6 +347,9 @@ else
   warn "  plugins list|poll|log            inspect plugins / force a poll now / show the plugin log"
   warn "  plugins install <git-url>        install a third-party plugin repo"
   warn "  show <file> [line|start-end]   show a file in a vim pane above this agent"
+  warn "  sessions list [--group NAME]                       active sessions as JSON"
+  warn "  sessions new --group NAME [--title T] [--pr ID]...  add a (hidden) session"
+  warn "  sessions archive <session_id>                     stop and archive a session"
   warn "  context read <session_id>"
   warn "  context write <session_id> <key> <value...>   keys: name, worktree, prs, tickets"
   exit 1
