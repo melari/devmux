@@ -855,7 +855,10 @@ module Devmux
         $stdout.write(group_title(group) + "\r\n")
         return true if @collapsed_groups.include?(group[:id])
       end
-      members.each { |a| $stdout.write(compact_row(a) + "\r\n") }
+      members.each do |a|
+        $stdout.write(compact_row(a) + "\r\n")
+        compact_tree(a).each { |line| $stdout.write(line + "\r\n") }
+      end
       true
     end
 
@@ -864,21 +867,28 @@ module Devmux
     # No checkbox. The bind icon's width is reserved so the name doesn't push it
     # off the narrow drawer.
     def compact_row(agent)
-      budget = cols - compact_icons_cols(agent) - bind_cols(agent) - bg_cols(agent) - 1
+      assoc = !@expanded.include?(agent[:name])
+      budget = cols - compact_icons_cols(agent, assoc: assoc) - bind_cols(agent) - bg_cols(agent) - 1
       name = truncate(agent[:display_plain].to_s, budget)
       body =
         if agent[:shown]
-          "#{compact_icons(agent)}#{name}"
+          "#{compact_icons(agent, assoc: assoc)}#{name}"
         else
           # Pane closed → name faint, but association icons keep their dimmed color.
-          "#{compact_icons(agent, mode: :dim)}#{faint_seg(name)}"
+          "#{compact_icons(agent, mode: :dim, assoc: assoc)}#{faint_seg(name)}"
         end
       body + bind_suffix(agent) + bg_suffix(agent)
     end
 
+    def compact_tree(agent)
+      (@rows || []).select { |row| %i[branch resource].include?(row[:type]) && row[:agent][:name] == agent[:name] }.map do |row|
+        row[:type] == :branch ? branch_row(row, indent: "") : resource_row(row, indent: "")
+      end
+    end
+
     # Agent glyph + one ticket/PR glyph per association, each with a trailing
     # space (2 cells for wide Nerd glyphs). See row_icons for `mode`.
-    def compact_icons(agent, mode: :normal)
+    def compact_icons(agent, mode: :normal, assoc: true)
       head =
         case mode
         when :normal then "#{colored_agent(agent)} "
@@ -886,13 +896,13 @@ module Devmux
         else "#{Icons.agent} "
         end
       parts = [head]
-      parts.concat(assoc_glyphs(agent, mode)) if Icons.nerd?
+      parts.concat(assoc_glyphs(agent, mode)) if assoc && Icons.nerd?
       parts.join
     end
 
-    def compact_icons_cols(agent)
+    def compact_icons_cols(agent, assoc: true)
       count = 1
-      count += resource_icons(agent).size if Icons.nerd?
+      count += resource_icons(agent).size if assoc && Icons.nerd?
       count * 2
     end
 
@@ -1044,14 +1054,14 @@ module Devmux
     # The worktree branch row (first child of an expanded session): a tree
     # connector, a branch glyph, and the branch name — all in normal gray. Enter
     # copies the branch name.
-    def branch_row(row)
+    def branch_row(row, indent: "  ")
       connector = row[:last] ? "└─" : "├─"
       icon = Icons.nerd? ? "\u{f126} " : ""
-      budget = cols - 5 - (Icons.nerd? ? 2 : 0) - 1
-      "  \e[38;5;240m#{connector}\e[0m \e[38;5;245m#{icon}#{truncate(row[:branch].to_s, budget)}\e[0m"
+      budget = cols - indent.length - 3 - (Icons.nerd? ? 2 : 0) - 1
+      "#{indent}\e[38;5;240m#{connector}\e[0m \e[38;5;245m#{icon}#{truncate(row[:branch].to_s, budget)}\e[0m"
     end
 
-    def resource_row(row)
+    def resource_row(row, indent: "  ")
       resource = row[:resource]
       branch = row[:last] ? "└─" : "├─"
       glyphs = resource[:icons].map { |ic| styled_assoc(ic[:glyph], ic[:color], :normal) }.join(" ")
@@ -1060,8 +1070,8 @@ module Devmux
       annotation = resource[:annotation].to_s
       ann = annotation.empty? ? "" : "\e[38;5;130m#{annotation}\e[0m "
       ann_cols = annotation.empty? ? 0 : annotation.length + 1
-      budget = cols - 5 - (resource[:icons].size * 2) - ann_cols - 1
-      "  \e[38;5;240m#{branch}\e[0m #{glyphs} #{ann}#{truncate(resource[:label].to_s, budget)}"
+      budget = cols - indent.length - 3 - (resource[:icons].size * 2) - ann_cols - 1
+      "#{indent}\e[38;5;240m#{branch}\e[0m #{glyphs} #{ann}#{truncate(resource[:label].to_s, budget)}"
     end
 
     # Inline annotations for a row (e.g. queued PRs' ETAs), each in brown with a
