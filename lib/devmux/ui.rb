@@ -895,15 +895,13 @@ module Devmux
     # off the narrow drawer.
     def compact_row(agent)
       assoc = !@expanded.include?(agent[:name])
-      budget = cols - compact_icons_cols(agent, assoc: assoc) - bind_cols(agent) - bg_cols(agent) - 1
-      name = truncate(agent[:display_plain].to_s, budget)
-      body =
-        if agent[:shown]
-          "#{compact_icons(agent, assoc: assoc)}#{name}"
-        else
-          # Pane closed → name faint, but association icons keep their dimmed color.
-          "#{compact_icons(agent, mode: :dim, assoc: assoc)}#{faint_seg(name)}"
-        end
+      mode = agent[:shown] ? :normal : :dim
+      avail = cols - bind_cols(agent) - bg_cols(agent) - 1
+      glyphs = assoc && Icons.nerd? ? assoc_glyphs(agent, mode).first([(avail / 2) - 1, 0].max) : []
+      icons = "#{colored_agent(agent)} #{glyphs.join}"
+      name = truncate(agent[:display_plain].to_s, avail - ((glyphs.size + 1) * 2))
+      # Pane closed → name faint, but association icons keep their dimmed color.
+      body = agent[:shown] ? "#{icons}#{name}" : "#{icons}#{faint_seg(name)}"
       line = body + bind_suffix(agent) + bg_suffix(agent)
       with_row_bg(line, agent_bg(agent))
     end
@@ -914,19 +912,6 @@ module Devmux
       end
     end
 
-    # Agent glyph + one ticket/PR glyph per association, each with a trailing
-    # space (2 cells for wide Nerd glyphs). See row_icons for `mode`.
-    def compact_icons(agent, mode: :normal, assoc: true)
-      parts = ["#{colored_agent(agent)} "]
-      parts.concat(assoc_glyphs(agent, mode)) if assoc && Icons.nerd?
-      parts.join
-    end
-
-    def compact_icons_cols(agent, assoc: true)
-      count = 1
-      count += resource_icons(agent).size if assoc && Icons.nerd?
-      count * 2
-    end
 
     def truncate(str, width)
       return "" if width <= 0
@@ -1144,7 +1129,7 @@ module Devmux
 
     def agent_bg(agent)
       return FOCUS_SGR if agent[:focused]
-      return nil if @expanded.include?(agent[:name])
+      return nil if @expanded.include?(agent[:name]) || agent[:resources]["prs"].size > 1
       resource_list(agent).filter_map { |r| r[:bg] }.first
     end
 
