@@ -27,6 +27,14 @@ module Devmux
         "closed" => "38;5;203", # red
       }.freeze
 
+      # Dim row background for a PR that's ready to merge (green) or already
+      # merged (purple). Applied to the PR's own line, or to the session's single
+      # row when it's collapsed.
+      BACKGROUND = {
+        "ready"  => "48;5;22",  # dark green
+        "merged" => "48;5;53",  # dark purple
+      }.freeze
+
       # A PR in the merge queue swaps the PR glyph for a queue marker, in brown.
       QUEUED_ICON = { glyph: "\u{f4db}", color: "38;5;130" }.freeze
 
@@ -117,6 +125,7 @@ module Devmux
           end
         details[:title] = rec["title"] unless rec["title"].to_s.empty?
         details[:icons] = [CI_ICONS[rec["ci"]], approval_icon(rec["approvals"])].compact
+        details[:background] = background_for(rec)
         details
       end
 
@@ -137,6 +146,7 @@ module Devmux
         data = @store.read
         data["resources"] ||= {}
         attached.each { |id, pr| data["resources"][id] = store_rec(pr) }
+        notify_ready(data, attached)
         @store.write(data)
       end
 
@@ -146,11 +156,49 @@ module Devmux
         @store.read["resources"] || {}
       end
 
+      def background_for(rec)
+        return BACKGROUND["merged"] if rec["state"] == "merged"
+        return BACKGROUND["ready"] if ready_to_merge?(rec)
+        nil
+      end
+
+      def ready_to_merge?(rec)
+        rec["state"] == "open" && !rec["conflict"] && rec["ci"] == "passing" &&
+          rec["approvals"].is_a?(Integer) && rec["approvals"] >= APPROVALS_NEEDED
+      end
+
       def approval_icon(count)
         return nil unless count.is_a?(Integer)
         glyph = [0xF0C9F + (2 * count.clamp(0, 9))].pack("U")
         color = count >= APPROVALS_NEEDED ? "38;5;40" : "38;5;240"
         { glyph: glyph, color: color }
+      end
+
+      def notify_ready(data, attached)
+        notified = data["notified_ready"] ||= []
+        attached.each do |id, pr|
+          rec = store_rec(pr)
+          next unless ready_to_merge?(rec)
+          next if notified.include?(id)
+          notified << id
+          notify_pr("Ready to merge: #{short_id(id)}", rec["title"], resource_url(id))
+        end
+      end
+
+      def notify_pr(title, body, url)
+        if system("which", "terminal-notifier", out: File::NULL, err: File::NULL)
+          args = ["terminal-notifier", "-title", title, "-message", body.to_s, "-group", "devmux-#{title}"]
+          args += ["-open", url] if url
+          system(*args, out: File::NULL, err: File::NULL)
+        else
+          script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+          system("osascript", "-e", script, title, body.to_s, out: File::NULL, err: File::NULL)
+        end
+      end
+
+      def short_id(id)
+        _owner, repo, _type, number = id.split(":", 2).last.split("/")
+        "#{repo}##{number}"
       end
 
       def store_rec(pr)
