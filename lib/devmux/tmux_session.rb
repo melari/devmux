@@ -8,6 +8,7 @@ require "devmux/tmux"
 require "devmux/drawer"
 require "devmux/registry"
 require "devmux/plugins"
+require "devmux/window_layout"
 require "devmux/plugin_host"
 require "devmux/projects"
 require "devmux/groups"
@@ -90,11 +91,11 @@ module Devmux
     # existing Chrome tab already showing the URL (so clicking a PR icon twice
     # doesn't pile up duplicate tabs); only open a fresh tab if none matches.
     # Falls back to `open` / `xdg-open`. Fire-and-forget; failures are swallowed.
-    def open_url(url)
+    def open_url(url, match: url)
       url = url.to_s
       return if url.empty?
       if RUBY_PLATFORM.include?("darwin")
-        return if focus_chrome_tab(url)
+        return if focus_chrome_tab(url, match.to_s)
         return if open_in_main_chrome(url)
         system("open", url, out: File::NULL, err: File::NULL)
       else
@@ -104,13 +105,14 @@ module Devmux
       nil
     end
 
-    # Focus an existing tab in the main Chrome whose URL starts with `url` (covers
-    # PR sub-pages like /files). Returns true if a matching tab was focused.
-    # The URL is passed as an argv argument to avoid script string escaping.
-    def focus_chrome_tab(url)
+    # Focus an existing tab in the main Chrome whose URL starts with `match`
+    # (covers PR sub-pages like /changes), navigating it to `url` if it's on a
+    # different page. Returns true if a matching tab was focused.
+    # The URLs are passed as argv arguments to avoid script string escaping.
+    def focus_chrome_tab(url, match = url)
       pid = main_chrome_pid
       return false unless pid
-      system("osascript", "-l", "JavaScript", "-e", CHROME_FOCUS_SCRIPT, pid.to_s, url,
+      system("osascript", "-l", "JavaScript", "-e", CHROME_FOCUS_SCRIPT, pid.to_s, match, url,
              out: File::NULL, err: File::NULL)
     rescue StandardError
       false
@@ -130,14 +132,17 @@ module Devmux
       ObjC.import("ScriptingBridge")
       function run(argv) {
         const app = $.SBApplication.applicationWithProcessIdentifier(parseInt(argv[0]))
-        const target = argv[1]
+        const match = argv[1]
+        const target = argv[2]
         const windows = app.valueForKey("windows")
         for (let w = 0; w < windows.count; w++) {
           const win = windows.objectAtIndex(w)
           const tabs = win.valueForKey("tabs")
           for (let t = 0; t < tabs.count; t++) {
-            const u = String(ObjC.unwrap(tabs.objectAtIndex(t).valueForKey("URL")))
-            if (u === target || ["/", "?", "#"].some(sep => u.startsWith(target + sep))) {
+            const tab = tabs.objectAtIndex(t)
+            const u = String(ObjC.unwrap(tab.valueForKey("URL")))
+            if (u === match || ["/", "?", "#"].some(sep => u.startsWith(match + sep))) {
+              if (u !== target) tab.setValueForKey($(target), "URL")
               win.setValueForKey(t + 1, "activeTabIndex")
               win.setValueForKey(1, "index")
               Application("System Events").processes.whose({ unixId: parseInt(argv[0]) })[0].frontmost = true
@@ -518,29 +523,11 @@ module Devmux
     # The pane command for a raw console (the `c` key): an interactive login-ish
     # shell in the agent's working directory. We `cd` then `exec` the shell so the
     # pane starts in the right place and closes when you type `exit`, like the
-    # vim/diff panes close on quit.
+    # vim pane closes on quit.
     def console_launch_command(cwd)
       shell = ENV["SHELL"].to_s
       shell = "/bin/sh" if shell.empty?
       cwd.to_s.empty? ? shell : "cd #{cwd.shellescape} && exec #{shell}"
-    end
-
-    # The pane command for showing a diff: diffnav in watch mode, which runs
-    # `diff_command` itself (git/gh) and periodically re-runs it to refresh. No
-    # shell fallback — when you press `q`, diffnav exits and the pane closes, the
-    # same way the vim "show" pane does. `watch_interval` (e.g. "30s") throttles
-    # the re-runs; used for the gh PR mode so it isn't hitting the API constantly.
-    # $DEVMUX_DIFF_PAGER can override the binary (must be diffnav-compatible).
-    def diff_launch_command(diff_command, watch_interval: nil)
-      pager = ENV["DEVMUX_DIFF_PAGER"].to_s
-      pager = "diffnav" if pager.empty?
-      argv = [pager, "--watch", "--watch-cmd", diff_command]
-      argv += ["--watch-interval", watch_interval] if watch_interval
-      # delta (which diffnav wraps) only paints its 24-bit add/delete backgrounds
-      # when it detects truecolor, and it keys off COLORTERM — which tmux doesn't
-      # set in the pane, so the green "add" background collapses to black. Force it
-      # on for this pane (sh runs the command, so a VAR=val prefix works).
-      "COLORTERM=truecolor #{Shellwords.join(argv)}"
     end
 
     # Private config on a private socket: hide the status bar, keep our pane
@@ -703,14 +690,12 @@ module Devmux
     # Pane user-option marking a pane as an agent's "show" vim pane, valued with
     # the agent's name, so we keep one vim pane per agent and can find it.
     VIM_OPTION = "@devmux_vim".freeze
-    # Same idea for an agent's "diff" pane (the `d` key): one per agent, marked
-    # with the agent's name.
-    DIFF_OPTION = "@devmux_diff".freeze
     # And for an agent's "console" pane (the `c` key): a raw shell, one per agent.
     CONSOLE_OPTION = "@devmux_console".freeze
     # Pane user-option holding the running background-process marker (a plugin's
     # icon + name), shown in the title while a plugin action's process runs.
     BG_OPTION = "@devmux_bg".freeze
+    FOCUS_OPTION = "@devmux_focus".freeze
     # Fixed attention color for background-process indicators (title + sidebar).
     BG_COLOR = "38;5;214".freeze
 
@@ -780,6 +765,7 @@ module Devmux
     # the slug) shown to the user.
     def agents
       shown = shown_panes
+      focused = focused_session
       bind = bind_state
       group_ids = Groups.ids
       @registry.agents.map do |a|
@@ -790,6 +776,7 @@ module Devmux
           display_plain: TmuxSession.display_label(a, brackets: false), state: agent_state(a),
           resources: resource_map(ctx),
           shown: shown.key?(a["name"]), archived: !!a["archived"],
+          focused: a["name"] == focused,
           # Membership: the group id, or nil for the implicit unnamed group (also
           # nil when the id points at a since-deleted group).
           group: (group_ids.include?(gid) ? gid : nil),
@@ -865,20 +852,17 @@ module Devmux
       dir if dir && !dir.empty? && File.directory?(dir)
     end
 
-    # Enter on an agent row: hide the pane (kill it — Claude has saved the
-    # conversation) or show it again (resuming the conversation if one exists,
-    # otherwise starting fresh). Showing keeps focus in the drawer so the user
-    # can keep managing sessions and Ctrl-Space over when ready.
+    # Enter on an agent row: hide the pane (moved to the hidden session, so the
+    # agent keeps running) or show it again (rejoining a hidden pane, else
+    # resuming the conversation if one exists, otherwise starting fresh). Showing
+    # keeps focus in the drawer so the user can keep managing sessions and
+    # Ctrl-Space over when ready.
     def toggle(name)
       record = @registry.record(name)
       return unless record
       pane = shown_panes[name]
       if pane
-        close_vim_pane(name)
-        close_diff_pane(name)
-        close_console_pane(name)
-        stop_session_actions(name)
-        hide_pane(pane)
+        hide_agent(name, pane)
       else
         # Showing an archived agent brings it back to the active list.
         @registry.set_archived(name, false) if record["archived"]
@@ -889,15 +873,7 @@ module Devmux
     # Set an agent aside: close its pane (if shown) and mark it archived so it
     # moves out of the active list into the archived disclosure.
     def archive(name)
-      pane = shown_panes[name]
-      if pane
-        close_vim_pane(name)
-        close_diff_pane(name)
-        close_console_pane(name)
-        stop_session_actions(name)
-        @tmux.close(pane)
-        TmuxSession.rebalance_agents(@tmux)
-      end
+      stop_agent(name)
       @registry.set_archived(name, true)
     end
 
@@ -909,16 +885,83 @@ module Devmux
     # Permanently drop an agent: close its pane (if shown) and remove its
     # registry record. The underlying Claude conversation on disk is left intact.
     def delete(name)
-      pane = shown_panes[name]
-      if pane
-        close_vim_pane(name)
-        close_diff_pane(name)
-        close_console_pane(name)
-        stop_session_actions(name)
-        @tmux.close(pane)
-        TmuxSession.rebalance_agents(@tmux)
-      end
+      stop_agent(name)
       @registry.delete(name)
+    end
+
+    def hide_agent(name, pane)
+      close_vim_pane(name)
+      close_console_pane(name)
+      hide_pane(pane)
+    end
+
+    def stop_agent(name)
+      stop_session_actions(name)
+      stashed = stashed_panes[name]
+      @tmux.close(stashed) if stashed
+      pane = shown_panes[name]
+      return unless pane
+      close_vim_pane(name)
+      close_console_pane(name)
+      @tmux.close(pane)
+      TmuxSession.rebalance_agents(@tmux)
+    end
+
+    def focus_state
+      raw = @tmux.get_option(FOCUS_OPTION)
+      raw.empty? ? nil : JSON.parse(raw)
+    rescue JSON::ParserError
+      nil
+    end
+
+    def focused_session
+      state = focus_state
+      state && state["name"]
+    end
+
+    def toggle_focus(name)
+      focused_session ? exit_focus : enter_focus(name)
+    end
+
+    def enter_focus(name)
+      record = @registry.record(name)
+      return unless record
+      state = focus_state
+      restore = state ? state["restore"] : shown_panes.keys
+      shown_panes.each { |other, pane| hide_agent(other, pane) unless other == name }
+      @registry.set_archived(name, false) if record["archived"]
+      pane = shown_panes[name] || show_pane(record)
+      TmuxSession.set_layout(@tmux, TmuxSession::COLLAPSED_WIDTH)
+      @tmux.focus(pane)
+      @tmux.set_option(FOCUS_OPTION, JSON.generate("name" => name, "restore" => restore))
+    end
+
+    def exit_focus
+      state = focus_state
+      return unless state
+      @tmux.set_option(FOCUS_OPTION, "")
+      restore = Array(state["restore"])
+      shown_panes.each { |name, pane| hide_agent(name, pane) unless restore.include?(name) }
+      restore.each do |name|
+        record = @registry.record(name)
+        show_pane(record) if record && !record["archived"] && !shown_panes.key?(name)
+      end
+      panes = shown_panes
+      @tmux.focus(panes[state["name"]] || panes.values.first || @manager_id)
+      WindowLayout.restore
+      settle_layout
+    end
+
+    def settle_layout
+      panes = @tmux.panes
+      manager = panes.find { |p| p[:id] == @manager_id }
+      return unless manager
+      width = if manager[:active]
+                Drawer.expanded_width(panes, @tmux.get_option(Drawer::WIDTH_OPTION).to_i)
+              else
+                TmuxSession::COLLAPSED_WIDTH
+              end
+      TmuxSession.set_layout(@tmux, width)
     end
 
     def detach
@@ -938,7 +981,8 @@ module Devmux
     def pane_state
       panes = @tmux.panes
       { focused: panes.any? { |p| p[:active] && p[:id] == @manager_id },
-        shown: panes.filter_map { |p| p[:agent] } }
+        shown: panes.filter_map { |p| p[:agent] },
+        window_width: panes.first && panes.first[:window_width] }
     rescue StandardError
       { focused: true, shown: nil }
     end
@@ -1165,7 +1209,7 @@ module Devmux
     end
 
     # Open (or focus) a raw console pane for the hovered session: a shell split
-    # above its agent like the vim/diff panes. One per agent — reused if already
+    # above its agent like the vim pane. One per agent — reused if already
     # open. `target` picks the directory: :worktree (the session's worktree, the
     # `c` key) or :main (that worktree's main repo, the `C` key). When the console
     # already exists we `cd` it to the requested target (clearing the input line
@@ -1213,73 +1257,6 @@ module Devmux
       @tmux.close(pane) if pane
     end
 
-    # Show a diff for the highlighted session in a pane above its agent (same
-    # split style as the vim "show" pane), rendered through diffnav in watch mode.
-    # Two modes:
-    #   - resource_id is a PR  -> `gh pr diff <n> -R owner/repo`
-    #   - otherwise            -> the worktree branch vs the repo's main branch,
-    #                             `git -C <worktree> diff <main>...HEAD`
-    # diffnav re-runs that command periodically to auto-refresh; the PR mode uses a
-    # longer interval so it isn't hammering the GitHub API. One diff pane per agent:
-    # any existing one is replaced so the diff is always current. Needs the agent
-    # shown (there must be a pane to split). Focuses the new pane — pressing `d` is
-    # a request to look at the diff — and closes on `q`, like the vim pane.
-    def show_diff(name, resource_id: nil)
-      agent_pane = shown_panes[name]
-      return unless agent_pane
-      pr = resource_id && pr_identifier?(resource_id)
-      command = pr ? pr_diff_command(resource_id) : worktree_diff_command(name, agent_pane)
-      return unless command
-      close_diff_pane(name)
-      launch = TmuxSession.diff_launch_command(command, watch_interval: (pr ? "30s" : nil))
-      id = @tmux.split_above(agent_pane, launch)
-      @tmux.set_pane_option(id, DIFF_OPTION, name)
-      @tmux.focus(id)
-    end
-
-    # True if an identifier is a GitHub PR id (github:owner/repo/pull/<n>).
-    def pr_identifier?(id)
-      id.to_s.match?(%r{\Agithub:[^/]+/[^/]+/pull/\d+\z})
-    end
-
-    # `gh pr diff` for a github PR id, scoped with -R so it works from any cwd.
-    def pr_diff_command(id)
-      _scheme, body = id.to_s.split(":", 2)
-      owner, repo, _kind, number = body.to_s.split("/")
-      return nil unless owner && repo && number
-      "gh pr diff #{number.shellescape} -R #{"#{owner}/#{repo}".shellescape}"
-    end
-
-    # A git diff for the session's worktree (falling back to the agent pane's cwd)
-    # against the repo's primary branch — the branch's whole diff INCLUDING
-    # uncommitted work. We diff from the merge-base to the working tree (`git diff
-    # <merge-base>`), not `<main>...HEAD`: the three-dot form only covers committed
-    # commits and omits staged/unstaged changes. The merge-base is resolved here
-    # (not left as a `$(...)` in the command) so it works whether or not diffnav
-    # runs the watch command through a shell. Falls back to the branch name if the
-    # merge-base can't be computed.
-    def worktree_diff_command(name, agent_pane)
-      record = @registry.record(name)
-      dir = ((record && record["context"]) || {})["worktree"].to_s
-      dir = @tmux.pane_current_path(agent_pane).to_s if dir.empty?
-      return nil if dir.empty?
-      branch = primary_branch(dir) || "main"
-      base = git(dir, "merge-base", branch, "HEAD") || branch
-      # --no-optional-locks: diffnav re-runs this on a watch loop inside the
-      # worktree, so don't take the index lock and contend with the agent's git.
-      "git --no-optional-locks -C #{dir.shellescape} diff #{base.shellescape}"
-    end
-
-    def diff_pane_for(name)
-      pane = @tmux.panes.find { |p| p[:diff] == name }
-      pane && pane[:id]
-    end
-
-    def close_diff_pane(name)
-      pane = diff_pane_for(name)
-      @tmux.close(pane) if pane
-    end
-
     # Rename a session (set its context "name"); updates the pane title too.
     def rename(name, title)
       record = @registry.record(name)
@@ -1309,9 +1286,36 @@ module Devmux
 
     # Open the browser URL for a resource id (a clicked ticket/PR icon), via the
     # owning plugin. No-op if the plugin can't resolve a URL.
-    def open_resource(identifier)
+    def open_resource(identifier, name = nil, path: nil)
       url = Plugins.resource_url(identifier)
-      TmuxSession.open_url(url) if url
+      return unless url
+      TmuxSession.open_url(path ? "#{url}#{path}" : url, match: url)
+      owner = pr_owner(identifier, name)
+      return unless owner
+      split_layout
+      enter_focus(owner)
+    end
+
+    def pr_owner(identifier, name)
+      owners = @registry.agents.select { |a| Array((a["context"] || {})["prs"]).include?(identifier) }
+      owner = owners.find { |a| a["name"] == name } || owners.first
+      owner && owner["name"]
+    end
+
+    def split_layout
+      return unless RUBY_PLATFORM.include?("darwin")
+      clients = @tmux.client_pids
+      Thread.new do
+        pid = nil
+        30.times do
+          pid = TmuxSession.main_chrome_pid
+          break if pid
+          sleep 0.1
+        end
+        WindowLayout.split(clients, pid)
+      rescue StandardError => e
+        TmuxSession.log_error("window-layout", e)
+      end
     end
 
     # Open the settings menu in a centered popup. Runs `devmux settings-menu` (its
@@ -1607,7 +1611,7 @@ module Devmux
     def supervise_bg
       return if @bg_mutex.synchronize { @bg_procs.empty? }
       attached = tmux_attached?
-      panes = shown_panes
+      panes = shown_panes.merge(stashed_panes)
       ended = []
       kill = []
       @bg_mutex.synchronize do
@@ -1751,7 +1755,7 @@ module Devmux
     def sync_panes
       by_name = @registry.agents.each_with_object({}) { |a, h| h[a["name"]] = a }
       bind = bind_state
-      commands = shown_panes.flat_map do |name, pane_id|
+      commands = shown_panes.merge(stashed_panes).flat_map do |name, pane_id|
         record = by_name[name]
         next [] unless record
         { LABEL_OPTION => TmuxSession.display_label(record), BAR_OPTION => agent_state(record),
@@ -1828,14 +1832,16 @@ module Devmux
       show_pane(record, focus_new: true)
     end
 
-    # Show a pane for a registry record: split to the right of the rightmost
-    # pane, tag it with its slug (stable identity) and display label, set
+    # Show a pane for a registry record: rejoin its hidden pane if it has one,
+    # else split to the right of the rightmost pane, tag it with its slug (stable identity) and display label, set
     # DEVMUX_SESSION so the agent can address itself in `devmux context`, and
     # re-even the agents. By default focus stays on the manager (the drawer stays
     # open for continued navigation); with focus_new the drawer collapses and we
     # land in the new pane.
     def show_pane(record, focus_new: false)
       name = record["name"]
+      stashed = stashed_panes[name]
+      return place_pane(stashed, focus_new) if stashed
       env = { "DEVMUX_SESSION" => record["uuid"] }
       env["DEVMUX_BIN"] = @exe if @exe
       id = @tmux.split_right(target: rightmost_pane, cwd: agent_cwd(record),
@@ -1846,6 +1852,11 @@ module Devmux
       @tmux.set_pane_option(id, BAR_OPTION, agent_state(record))
       @tmux.set_pane_option(id, ICONS_OPTION, TmuxSession.title_icons(record))
       @tmux.set_pane_option(id, BIND_OPTION, bind_marker(record))
+      place_pane(id, focus_new)
+    end
+
+    def place_pane(id, focus_new)
+      @tmux.unstash(id, target: rightmost_pane) unless @tmux.panes.any? { |p| p[:id] == id }
       if focus_new
         TmuxSession.set_layout(@tmux, TmuxSession::COLLAPSED_WIDTH)
         @tmux.focus(id)
@@ -1884,7 +1895,7 @@ module Devmux
           end
         end
         { id: id, icons: icons, label: resource_label(id, details),
-          annotation: details && details[:annotation] }
+          annotation: details && details[:annotation], bg: details && details[:background] }
       end
     end
 
@@ -1930,8 +1941,12 @@ module Devmux
     # Hide a pane: kill it and re-even the survivors. Focus stays on the manager
     # (where the user pressed Enter), so the list keeps navigating.
     def hide_pane(pane_id)
-      @tmux.close(pane_id)
+      @tmux.stash(pane_id)
       TmuxSession.rebalance_agents(@tmux)
+    end
+
+    def stashed_panes
+      @tmux.stashed_panes.each_with_object({}) { |p, h| h[p[:agent]] = p[:id] }
     end
 
     # { agent_name => pane_id } for currently-shown agent panes, keyed by the

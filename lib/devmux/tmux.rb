@@ -14,7 +14,7 @@ module Devmux
     # format string (escaped so Ruby doesn't interpolate it). The trailing
     # @devmux_agent is our own pane user-option — a stable identity that the
     # program in the pane can't overwrite the way it can the title.
-    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}\t\#{@devmux_diff}\t\#{@devmux_console}\t\#{window_width}".freeze
+    PANE_FMT = "\#{pane_id}\t\#{pane_title}\t\#{pane_width}\t\#{pane_left}\t\#{pane_active}\t\#{@devmux_agent}\t\#{@devmux_vim}\t\#{@devmux_console}\t\#{window_width}".freeze
 
     def self.available?
       system("tmux", "-V", out: File::NULL, err: File::NULL)
@@ -44,11 +44,10 @@ module Devmux
     # @devmux_agent user-option (nil when unset, e.g. the manager pane).
     def panes
       capture("list-panes", "-t", @session, "-F", PANE_FMT).each_line.map do |line|
-        id, title, width, left, active, agent, vim, diff, console, window_width = line.chomp.split("\t", -1)
+        id, title, width, left, active, agent, vim, console, window_width = line.chomp.split("\t", -1)
         { id: id, title: title, width: width.to_i, left: left.to_i,
           active: active == "1", agent: (agent.nil? || agent.empty? ? nil : agent),
           vim: (vim.nil? || vim.empty? ? nil : vim),
-          diff: (diff.nil? || diff.empty? ? nil : diff),
           console: (console.nil? || console.empty? ? nil : console),
           window_width: window_width.to_i }
       end.sort_by { |p| p[:left] }
@@ -67,6 +66,13 @@ module Devmux
       0
     end
 
+    def client_pids
+      out = capture("list-clients", "-t", @session, "-F", "\#{client_activity} \#{client_pid}")
+      out.lines.map { |l| l.split.map(&:to_i) }.sort_by { |activity, _| -activity }.map(&:last)
+    rescue Error
+      []
+    end
+
     # Start the server + session detached, running `command` in its single
     # (manager) pane. -f loads our private config; only takes effect here, when
     # the server is first created.
@@ -78,7 +84,7 @@ module Devmux
     # Split `target` vertically, placing the new pane to its right; returns the
     # new pane's id. `-f` makes the new pane span the FULL window height rather
     # than just the target's cell, so a new agent is a full-height column on the
-    # right even when the target agent has a stacked vim/diff/console pane above it
+    # right even when the target agent has a stacked vim/console pane above it
     # (otherwise the new agent would land below that stack). tmux focuses the new
     # pane by default. `env` sets pane environment variables (-e KEY=VAL).
     def split_right(target:, cwd:, command:, name:, env: {})
@@ -158,11 +164,41 @@ module Devmux
       run("kill-pane", "-t", pane_id)
     end
 
+    def hidden_session
+      "hidden-#{@session}"
+    end
+
+    def stash(pane_id)
+      unless system("tmux", "-L", SOCKET, "has-session", "-t", "=#{hidden_session}",
+                    out: File::NULL, err: File::NULL)
+        run("new-session", "-d", "-s", hidden_session, "-x", "200", "-y", "50", "tail -f /dev/null")
+      end
+      run("break-pane", "-d", "-s", pane_id, "-t", "=#{hidden_session}:")
+    end
+
+    def unstash(pane_id, target:)
+      run("join-pane", "-h", "-f", "-d", "-s", pane_id, "-t", target)
+    end
+
+    def stashed_panes
+      capture("list-panes", "-s", "-t", "=#{hidden_session}", "-F", PANE_FMT).each_line.filter_map do |line|
+        id, _title, _w, _l, _a, agent = line.chomp.split("\t", -1)
+        { id: id, agent: agent } unless agent.to_s.empty?
+      end
+    rescue Error
+      []
+    end
+
     def detach
       run("detach-client", "-s", @session)
     end
 
     def kill_session
+      begin
+        run("kill-session", "-t", "=#{hidden_session}")
+      rescue Error
+        nil
+      end
       run("kill-session", "-t", @session)
     end
 

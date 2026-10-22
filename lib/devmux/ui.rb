@@ -67,6 +67,7 @@ module Devmux
       @confirm = nil
       @highlighted = :unset # sentinel so the first update_highlight always applies
       @focused = :unset     # sentinel so the first sync_drawer always applies
+      @window_width = nil   # last seen window width, so a resize re-lays the drawer
       @published_hover = nil # sentinel so the first publish_hover always applies
       @published_width = nil # sentinel so the first publish_width always applies
       @expanded = Set.new   # session names shown as a resource tree
@@ -124,7 +125,7 @@ module Devmux
               render
             end
             became_focused = focused && @focused != true
-            sync_drawer(focused)
+            sync_drawer(focused, panes[:window_width])
             select_on_expand if became_focused
             update_highlight(focused)
             publish_hover
@@ -265,7 +266,7 @@ module Devmux
       when :shift_enter  then toggle_tree_all
       when " "           then select_pane
       when "a"        then archive_selected
-      when "d"        then show_diff_selected
+      when "d"        then open_pr(path: "/changes")
       when "n"        then @backend.new_agent_pick
       when "p"        then open_pr
       when "t"        then open_ticket
@@ -275,6 +276,7 @@ module Devmux
       when "m"        then open_actions_menu
       when "r"        then rename_selected
       when "z"        then @backend.open_settings
+      when "f"        then toggle_focus
       when "?"        then @hints_expanded = !@hints_expanded
       when "q"        then @backend.detach
       end
@@ -294,7 +296,7 @@ module Devmux
       @sel = row_index
       if row[:type] == :agent
         id = clicked_resource_id(row[:agent], event[:x])
-        id ? @backend.open_resource(id) : nil
+        id ? @backend.open_resource(id, row[:agent][:name]) : nil
       else
         expand_collapse # archive header / show-more
       end
@@ -437,7 +439,7 @@ module Devmux
 
     # Open a tree resource row's URL, then focus its agent pane (if open).
     def open_resource_row(row)
-      @backend.open_resource(row[:resource][:id])
+      @backend.open_resource(row[:resource][:id], row[:agent][:name])
       @backend.focus_agent(row[:agent][:name])
     end
 
@@ -483,12 +485,21 @@ module Devmux
     # Open the selected session's first associated pull request in the browser,
     # then return focus to its agent pane (if open) so the terminal is on the
     # agent when you come back.
-    def open_pr
-      a = selected_agent
-      return unless a
-      pr = a[:resources]["prs"].first
+    def open_pr(path: nil)
+      row = @rows[@sel]
+      return unless row && %i[agent resource].include?(row[:type])
+      a = row[:agent]
+      prs = a[:resources]["prs"]
+      pr =
+        if row[:type] == :resource
+          prs.find { |p| p[:id] == row[:resource][:id] }
+        elsif prs.size > 1
+          return flash("multiple PRs")
+        else
+          prs.first
+        end
       return unless pr
-      @backend.open_resource(pr[:id])
+      @backend.open_resource(pr[:id], a[:name], path: path)
       @backend.focus_agent(a[:name])
     end
 
@@ -500,7 +511,7 @@ module Devmux
     end
 
     # Open (or focus) a raw console (shell) pane for the hovered session, split
-    # above its agent like the vim/diff panes. `target` is :worktree (c) or :main
+    # above its agent like the vim pane. `target` is :worktree (c) or :main
     # (C). Needs an open agent pane.
     def open_console_selected(target)
       name = selected_agent_name
@@ -538,21 +549,20 @@ module Devmux
         bound: "binding…", unbound: "unbound" }[result]
     end
 
-    # Show a diff for the hovered row in a pane above its agent (through diffnav):
-    # a highlighted PR resource diffs that PR (gh); an agent (or non-PR resource)
-    # diffs its worktree branch vs the repo's main branch. The backend decides
-    # from the resource id.
-    def show_diff_selected
-      row = @rows[@sel]
-      return unless row
-      case row[:type]
-      when :resource then @backend.show_diff(row[:agent][:name], resource_id: row[:resource][:id])
-      when :agent    then @backend.show_diff(row[:agent][:name])
+    # Open the selected session's first associated ticket in the browser, then
+    # return focus to its agent pane (if open). Same flow as open_pr.
+    def toggle_focus
+      if focus_active?
+        @backend.exit_focus
+      elsif (name = selected_agent_name)
+        @backend.toggle_focus(name)
       end
     end
 
-    # Open the selected session's first associated ticket in the browser, then
-    # return focus to its agent pane (if open). Same flow as open_pr.
+    def focus_active?
+      (@agents || []).any? { |a| a[:focused] }
+    end
+
     def open_ticket
       a = selected_agent
       return unless a
@@ -606,10 +616,13 @@ module Devmux
 
     # Keep the drawer's size aligned to focus: expand when the drawer is the
     # focused pane, collapse when it isn't — so a mouse click or any other means
-    # of (de)focusing it resizes it, not just Ctrl-Space. Only acts on a change.
-    def sync_drawer(focused)
-      return if focused == @focused
+    # of (de)focusing it resizes it, not just Ctrl-Space. Also re-applies after the
+    # window's width changes (e.g. side-by-side placement), since tmux reflows the
+    # manager's width then. Only acts on a change.
+    def sync_drawer(focused, window_width)
+      return if focused == @focused && window_width == @window_width
       @focused = focused
+      @window_width = window_width
       focused ? @backend.expand_drawer(content_width) : @backend.collapse_drawer
     end
 
@@ -716,7 +729,7 @@ module Devmux
       checkbox = agent[:shown] ? CHECK_SHOWN : CHECK_HIDDEN
       head =
         if mode == :dim
-          [faint_seg("#{checkbox} "), faint_seg("#{Icons.agent} ")]
+          [faint_seg("#{checkbox} "), "#{colored_agent(agent)} "]
         else
           ["#{checkbox} ", "#{colored_agent(agent)} "]
         end
@@ -769,7 +782,8 @@ module Devmux
     # idle (needs_input), faint when hidden (not running).
     def colored_agent(agent)
       sgr =
-        if !agent[:shown] then "2;38;5;245"     # hidden — faint
+        if !agent[:shown]
+          agent[:state] == "busy" ? "2;38;5;208" : "2;38;5;245" # hidden — dimmed orange if busy, else faint
         elsif agent[:state] == "busy" then "38;5;208" # active — orange
         else "38;5;250"                           # idle — grey
         end
@@ -890,25 +904,20 @@ module Devmux
           # Pane closed → name faint, but association icons keep their dimmed color.
           "#{compact_icons(agent, mode: :dim, assoc: assoc)}#{faint_seg(name)}"
         end
-      body + bind_suffix(agent) + bg_suffix(agent)
+      line = body + bind_suffix(agent) + bg_suffix(agent)
+      with_row_bg(line, agent_bg(agent))
     end
 
     def compact_tree(agent)
       (@rows || []).select { |row| %i[branch resource].include?(row[:type]) && row[:agent][:name] == agent[:name] }.map do |row|
-        row[:type] == :branch ? branch_row(row, indent: "") : resource_row(row, indent: "")
+        row[:type] == :branch ? branch_row(row, indent: "") : with_row_bg(resource_row(row, indent: ""), row[:resource][:bg])
       end
     end
 
     # Agent glyph + one ticket/PR glyph per association, each with a trailing
     # space (2 cells for wide Nerd glyphs). See row_icons for `mode`.
     def compact_icons(agent, mode: :normal, assoc: true)
-      head =
-        case mode
-        when :normal then "#{colored_agent(agent)} "
-        when :dim    then faint_seg("#{Icons.agent} ")
-        else "#{Icons.agent} "
-        end
-      parts = [head]
+      parts = ["#{colored_agent(agent)} "]
       parts.concat(assoc_glyphs(agent, mode)) if assoc && Icons.nerd?
       parts.join
     end
@@ -1036,7 +1045,7 @@ module Devmux
         when :more
           muted("     … show more (#{row[:remaining]})")
         end
-      content = with_selection_bg(content) if selected
+      content = with_row_bg(content, row_bg(row, selected))
       "#{content}\r\n"
     end
 
@@ -1071,20 +1080,25 @@ module Devmux
       connector = row[:last] ? "└─" : "├─"
       icon = Icons.nerd? ? "\u{f126} " : ""
       budget = cols - indent.length - 3 - (Icons.nerd? ? 2 : 0) - 1
-      "#{indent}\e[38;5;240m#{connector}\e[0m \e[38;5;245m#{icon}#{truncate(row[:branch].to_s, budget)}\e[0m"
+      text = "#{icon}#{truncate(row[:branch].to_s, budget)}"
+      text = row[:agent][:shown] ? "\e[38;5;245m#{text}\e[0m" : faint_seg(text)
+      "#{indent}\e[38;5;240m#{connector}\e[0m #{text}"
     end
 
     def resource_row(row, indent: "  ")
       resource = row[:resource]
       branch = row[:last] ? "└─" : "├─"
-      glyphs = resource[:icons].map { |ic| styled_assoc(ic[:glyph], ic[:color], :normal) }.join(" ")
+      mode = row[:agent][:shown] ? :normal : :dim
+      glyphs = resource[:icons].map { |ic| styled_assoc(ic[:glyph], ic[:color], mode) }.join(" ")
       # Annotation (e.g. a queued PR's ETA) sits right after the icons, before the
       # label — not appended after it, where truncating a long title would clip it.
       annotation = resource[:annotation].to_s
       ann = annotation.empty? ? "" : "\e[38;5;130m#{annotation}\e[0m "
       ann_cols = annotation.empty? ? 0 : annotation.length + 1
       budget = cols - indent.length - 3 - (resource[:icons].size * 2) - ann_cols - 1
-      "#{indent}\e[38;5;240m#{branch}\e[0m #{glyphs} #{ann}#{truncate(resource[:label].to_s, budget)}"
+      label = truncate(resource[:label].to_s, budget)
+      label = faint_seg(label) unless row[:agent][:shown]
+      "#{indent}\e[38;5;240m#{branch}\e[0m #{glyphs} #{ann}#{label}"
     end
 
     # Inline annotations for a row (e.g. queued PRs' ETAs), each in brown with a
@@ -1110,9 +1124,28 @@ module Devmux
     # selection style so the background carries across the whole line, and a dark
     # default fg keeps plain text readable on white.
     SELECTION_SGR = "48;5;231;38;5;232".freeze
-    def with_selection_bg(content)
-      reassert = "\e[0m\e[#{SELECTION_SGR}m"
-      "\e[#{SELECTION_SGR}m#{content.gsub("\e[0m", reassert)}\e[0m"
+    FOCUS_SGR = "48;5;196;38;5;231".freeze
+    def with_bg(content, sgr)
+      reassert = "\e[0m\e[#{sgr}m"
+      "\e[#{sgr}m#{content.gsub("\e[0m", reassert)}\e[0m"
+    end
+
+    def row_bg(row, selected)
+      return SELECTION_SGR if selected
+      case row[:type]
+      when :agent then agent_bg(row[:agent])
+      when :resource then row[:resource][:bg]
+      end
+    end
+
+    def with_row_bg(content, sgr)
+      sgr ? with_bg(content, sgr) : content
+    end
+
+    def agent_bg(agent)
+      return FOCUS_SGR if agent[:focused]
+      return nil if @expanded.include?(agent[:name])
+      resource_list(agent).filter_map { |r| r[:bg] }.first
     end
 
     # How many columns the label may use in the full view before truncation:
@@ -1178,7 +1211,8 @@ module Devmux
       when :branch
         items << "[↵] copy branch"
       when :resource
-        items << "[↵] open" << "[d] diff"
+        items << "[↵] open"
+        items << "[p] PR" << "[d] PR diff" if row[:agent][:resources]["prs"].any? { |pr| pr[:id] == row[:resource][:id] }
       when :group_header
         items << (@collapsed_groups.include?(row[:group][:id]) ? "[↵] expand group" : "[↵] collapse group")
       when :agent
@@ -1187,14 +1221,19 @@ module Devmux
         items << "[a] archive" unless a[:archived]
         items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
         items << "[m] actions"
-        items << "[p] PR" unless a[:resources]["prs"].empty?
+        items << "[p] PR" << "[d] PR diff" if a[:resources]["prs"].size == 1
         items << "[t] ticket" unless a[:resources]["tickets"].empty?
         items << "[↵] tree" unless resource_list(a).empty?
-        items << "[d] diff" << "[⌫] delete"
+        items << "[⌫] delete"
       else
         items << "[↵] toggle"
       end
       items << "[n] new" << "[z] settings"
+      if focus_active?
+        items << "[f] exit focus"
+      elsif row && row[:type] == :agent
+        items << "[f] focus"
+      end
       items << "[?] hide help" << "[q] quit"
       items
     end
