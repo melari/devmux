@@ -3,6 +3,8 @@ require "devmux/plugins"
 require "devmux/groups"
 require "devmux/icons"
 require "devmux/sidebar_resources"
+require "devmux/tasks"
+require "tempfile"
 
 module Devmux
   # The settings popover: a small modal TUI launched in a centered tmux popup
@@ -17,7 +19,7 @@ module Devmux
   # Groups stores; the manager UI re-renders when it regains control after the
   # popup closes. Esc backs out of a category to the root, then closes the popup.
   class SettingsMenu
-    CATEGORIES = %w[Groups Plugins Resources].freeze
+    CATEGORIES = %w[Groups Plugins Resources Tasks].freeze
 
     def initialize
       @view = :root
@@ -45,7 +47,75 @@ module Devmux
       when :plugins then plugins_key(key)
       when :groups  then groups_key(key)
       when :resources then resources_key(key)
+      when :tasks then tasks_key(key)
       end
+    end
+
+    def tasks_key(key)
+      case key
+      when "j", :down then move(1, Tasks.all.size)
+      when "k", :up   then move(-1, Tasks.all.size)
+      when "a", "n" then add_task
+      when "e", "\r", "\n" then edit_task
+      when "d" then delete_task
+      when "\e", "q" then back_to_root
+      end
+      true
+    end
+
+    def add_task
+      name = prompt("Task name:")
+      return if name.nil? || name.strip.empty?
+      task = { "name" => name.strip, "prompt" => edit_text("") }
+      Tasks.add(task.merge(schedule_fields(task)))
+      @sel = Tasks.all.size - 1
+    end
+
+    def edit_task
+      task = Tasks.all[@sel]
+      return unless task
+      name = prompt("Task name:", task["name"])
+      attrs = {}
+      attrs["name"] = name.strip if name && !name.strip.empty?
+      attrs["prompt"] = edit_text(task["prompt"].to_s)
+      Tasks.update(task["id"], attrs.merge(schedule_fields(task)))
+    end
+
+    def schedule_fields(task)
+      interval = prompt("Run every N minutes (blank = manual only):", task["interval"].to_s)
+      return {} if interval.nil?
+      return { "interval" => nil } if interval.strip.empty?
+      minutes = interval.strip.to_i
+      return {} unless minutes.positive?
+      fields = { "interval" => minutes }
+      start = prompt("Working hours start (e.g. 9 or 9:30):", Tasks.format_time(task["hours_start"] || Tasks::DEFAULT_HOURS[0]))
+      finish = prompt("Working hours end (e.g. 17 or 17:30):", Tasks.format_time(task["hours_end"] || Tasks::DEFAULT_HOURS[1]))
+      fields["hours_start"] = Tasks.parse_time(start) if Tasks.parse_time(start)
+      fields["hours_end"] = Tasks.parse_time(finish) if Tasks.parse_time(finish)
+      fields
+    end
+
+    def delete_task
+      task = Tasks.all[@sel]
+      return unless task
+      Tasks.remove(task["id"])
+      @sel = [@sel, [Tasks.all.size - 1, 0].max].min
+    end
+
+    def edit_text(initial)
+      file = Tempfile.new(["devmux-task", ".md"])
+      file.write(initial)
+      file.close
+      IO.console.cooked { system(text_editor, file.path) }
+      File.read(file.path).strip
+    ensure
+      file&.unlink
+    end
+
+    def text_editor
+      override = ENV["DEVMUX_EDITOR"].to_s
+      return override unless override.empty?
+      %w[nvim vim vi].find { |cmd| system("which", cmd, out: File::NULL, err: File::NULL) } || "vi"
     end
 
     def root_key(key)
@@ -91,8 +161,8 @@ module Devmux
 
     def groups_key(key)
       case key
-      when "j", :down then move(1, Groups.all.size)
-      when "k", :up   then move(-1, Groups.all.size)
+      when "j", :down then move(1, Groups.configurable.size)
+      when "k", :up   then move(-1, Groups.configurable.size)
       when "J"      then reorder_group(1)
       when "K"      then reorder_group(-1)
       when "a", "n" then add_group
@@ -106,7 +176,7 @@ module Devmux
     # Shift-J/Shift-K: move the highlighted group up/down in the display order,
     # keeping the cursor on it.
     def reorder_group(delta)
-      group = Groups.all[@sel]
+      group = Groups.configurable[@sel]
       return unless group
       moved = Groups.move(group[:id], delta)
       @sel = moved if moved
@@ -118,13 +188,13 @@ module Devmux
     end
 
     def delete_group
-      group = Groups.all[@sel]
+      group = Groups.configurable[@sel]
       Groups.remove(group[:id]) if group && !group[:builtin]
-      @sel = [@sel, [Groups.all.size - 1, 0].max].min
+      @sel = [@sel, [Groups.configurable.size - 1, 0].max].min
     end
 
     def rename_group
-      group = Groups.all[@sel]
+      group = Groups.configurable[@sel]
       return unless group
       name = prompt("Rename to:", group[:name])
       Groups.rename(group[:id], name) if name && !name.strip.empty?
@@ -148,7 +218,27 @@ module Devmux
       when :plugins then render_plugins
       when :groups  then render_groups
       when :resources then render_resources
+      when :tasks then render_tasks
       end
+    end
+
+    def render_tasks
+      tasks = Tasks.all
+      lines = ["settings › tasks", ""]
+      if tasks.empty?
+        lines << dim("  (no tasks yet)")
+      else
+        tasks.each_with_index { |task, i| lines << task_row(task, i == @sel) }
+      end
+      lines << ""
+      lines << dim("[a] add   [e] edit   [d] delete   [esc] back")
+      draw(lines)
+    end
+
+    def task_row(task, selected)
+      cursor = selected ? "#{Icons.selector} " : "  "
+      text = "#{cursor}#{task['name']}  #{dim(Tasks.schedule_label(task))}"
+      selected ? text : dim(text)
     end
 
     def render_root
@@ -198,7 +288,7 @@ module Devmux
     end
 
     def render_groups
-      groups = Groups.all
+      groups = Groups.configurable
       lines = ["settings › groups", ""]
       if groups.empty?
         lines << dim("  (no groups yet)")

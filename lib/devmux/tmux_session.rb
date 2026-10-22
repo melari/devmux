@@ -9,6 +9,7 @@ require "devmux/drawer"
 require "devmux/registry"
 require "devmux/plugins"
 require "devmux/window_layout"
+require "devmux/tasks"
 require "devmux/plugin_host"
 require "devmux/projects"
 require "devmux/groups"
@@ -422,6 +423,15 @@ module Devmux
       claude_command("--session-id #{uuid}", exe: exe, uuid: uuid)
     end
 
+    def task_agent_command(uuid, prompt, exe: nil)
+      bin = exe || "devmux"
+      full = "#{prompt}\n\n" \
+             "This is a devmux background task. When you have completely finished it, run " \
+             "#{bin} task-done #{uuid} as your very last action; devmux then closes this session. " \
+             "Do not run it if you are blocked or waiting on the user."
+      claude_command("--session-id #{uuid} #{full.shellescape}", exe: exe, uuid: uuid)
+    end
+
     # Resume a previously-created agent by its session id.
     def resume_agent_command(uuid, exe: nil)
       claude_command("--resume #{uuid}", exe: exe, uuid: uuid)
@@ -754,6 +764,7 @@ module Devmux
       start_plugin_updater
       start_bg_supervisor
       start_worktree_tracker
+      start_task_scheduler
       # Backstop: kill any plugin background processes if the manager exits cleanly
       # (the per-process watchdog covers hard kills / tmux kill-server).
       at_exit { stop_all_actions }
@@ -840,6 +851,76 @@ module Devmux
       new_agent(project: project) if project
     rescue StandardError => e
       TmuxSession.log_error("project-pick", e)
+    end
+
+    def run_task_pick
+      bin = @exe || "devmux"
+      File.delete(Tasks.picked_path) if File.exist?(Tasks.picked_path)
+      @tmux.display_popup("#{bin.shellescape} task-picker",
+                          width: 64, height: 22, border: "heavy",
+                          border_style: "fg=colour208")
+      id = take_picked_task
+      run_task(id) if id
+    rescue StandardError => e
+      TmuxSession.log_error("task-pick", e)
+    end
+
+    def take_picked_task
+      path = Tasks.picked_path
+      return nil unless File.exist?(path)
+      data = JSON.parse(File.read(path)) rescue nil
+      File.delete(path) rescue nil
+      data && data["id"]
+    end
+
+    def run_task(id)
+      task = Tasks.find(id)
+      return unless task
+      Tasks.mark_run(id)
+      title = "#{task['name']} #{Time.now.strftime('%H:%M')}"
+      record = @registry.add(group: Groups.builtin_id(Groups::BACKGROUND_TASKS), task: id,
+                             context: { "name" => title })
+      env = { "DEVMUX_SESSION" => record["uuid"] }
+      env["DEVMUX_BIN"] = @exe if @exe
+      command = TmuxSession.task_agent_command(record["uuid"], task["prompt"].to_s, exe: @exe)
+      pane = @tmux.spawn_hidden(cwd: agent_cwd(record), command: command, name: record["name"], env: env)
+      tag_pane(pane, record)
+      record
+    end
+
+    TASK_TICK_SECONDS = 15
+
+    def start_task_scheduler
+      @task_scheduler = Thread.new do
+        loop do
+          begin
+            tick_tasks
+          rescue StandardError => e
+            TmuxSession.log_error("task-scheduler", e)
+          end
+          sleep TASK_TICK_SECONDS
+        end
+      end
+    end
+
+    def tick_tasks
+      running = settle_tasks
+      Tasks.all.each { |task| run_task(task["id"]) if Tasks.due?(task) && !running.include?(task["id"]) }
+    end
+
+    def settle_tasks
+      shown = shown_panes
+      alive = shown.merge(stashed_panes)
+      running = []
+      @registry.agents.each do |a|
+        next if a["archived"] || a["task"].nil?
+        if !alive.key?(a["name"]) || (!shown.key?(a["name"]) && (a["context"] || {})["task_done"])
+          delete(a["name"])
+        else
+          running << a["task"]
+        end
+      end
+      running
     end
 
     # Read (and remove) the project the picker chose, or nil if none/invalid.
@@ -1847,12 +1928,16 @@ module Devmux
       id = @tmux.split_right(target: rightmost_pane, cwd: agent_cwd(record),
                              command: TmuxSession.agent_command(record["uuid"], exe: @exe),
                              name: name, env: env)
-      @tmux.set_pane_option(id, AGENT_OPTION, name)
+      tag_pane(id, record)
+      place_pane(id, focus_new)
+    end
+
+    def tag_pane(id, record)
+      @tmux.set_pane_option(id, AGENT_OPTION, record["name"])
       @tmux.set_pane_option(id, LABEL_OPTION, TmuxSession.display_label(record))
       @tmux.set_pane_option(id, BAR_OPTION, agent_state(record))
       @tmux.set_pane_option(id, ICONS_OPTION, TmuxSession.title_icons(record))
       @tmux.set_pane_option(id, BIND_OPTION, bind_marker(record))
-      place_pane(id, focus_new)
     end
 
     def place_pane(id, focus_new)

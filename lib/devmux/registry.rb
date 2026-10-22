@@ -49,11 +49,13 @@ module Devmux
     # `project` (optional) is the directory the agent runs in — its pane's cwd.
     # Stored on the record so it survives hide/show and restarts; nil means "use
     # the default project" (see TmuxBackend#agent_cwd).
-    def add(project: nil)
+    def add(project: nil, group: nil, task: nil, context: {})
       mutate do |data|
         rec = { "name" => next_name(data), "uuid" => SecureRandom.uuid,
-                "archived" => false, "context" => {} }
+                "archived" => false, "context" => context }
         rec["project"] = project unless project.to_s.empty?
+        rec["group"] = group if group
+        rec["task"] = task if task
         data << rec
         save(data)
         rec

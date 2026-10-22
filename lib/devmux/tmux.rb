@@ -169,11 +169,24 @@ module Devmux
     end
 
     def stash(pane_id)
-      unless system("tmux", "-L", SOCKET, "has-session", "-t", "=#{hidden_session}",
-                    out: File::NULL, err: File::NULL)
-        run("new-session", "-d", "-s", hidden_session, "-x", "200", "-y", "50", "tail -f /dev/null")
-      end
+      ensure_hidden_session
       run("break-pane", "-d", "-s", pane_id, "-t", "=#{hidden_session}:")
+    end
+
+    def spawn_hidden(cwd:, command:, name:, env: {})
+      ensure_hidden_session
+      args = ["new-window", "-d", "-t", "=#{hidden_session}:", "-c", cwd, "-P", "-F", "\#{pane_id}"]
+      env.each { |key, value| args += ["-e", "#{key}=#{value}"] }
+      args << command
+      id = capture(*args).strip
+      set_title(id, name)
+      id
+    end
+
+    def ensure_hidden_session
+      return if system("tmux", "-L", SOCKET, "has-session", "-t", "=#{hidden_session}",
+                       out: File::NULL, err: File::NULL)
+      run("new-session", "-d", "-s", hidden_session, "-x", "200", "-y", "50", "tail -f /dev/null")
     end
 
     def unstash(pane_id, target:)

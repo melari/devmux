@@ -17,6 +17,7 @@ require "devmux/ui"
 require "devmux/plugins_menu"
 require "devmux/settings_menu"
 require "devmux/project_picker"
+require "devmux/task_picker"
 
 EXE = File.expand_path(__FILE__)
 
@@ -298,6 +299,12 @@ when "project-picker"
   # Invoked inside a tmux popup by the manager's "N" key: pick a project for a
   # new agent. Writes its choice to the handoff file the manager reads back.
   Devmux::ProjectPicker.new.run
+when "task-picker"
+  Devmux::TaskPicker.new.run
+when "task-done"
+  id = ARGV.shift || die("usage: devmux task-done <session_id>")
+  die "no such session: #{id}" unless registry.write_context(id, "task_done", true)
+  puts "ok: devmux will close this session"
 when "sessions"
   sub = ARGV.shift
   case sub
@@ -344,6 +351,8 @@ else
   warn "  tmux-toggle   toggle the manager drawer (used by the Ctrl-Space bind)"
   warn "  settings-menu   the settings menu: plugins + groups (used inside the manager's popup)"
   warn "  project-picker  pick a project for a new agent (used inside the manager's popup)"
+  warn "  task-picker     pick a background task to run (used inside the manager's popup)"
+  warn "  task-done <session_id>   a background task's agent reports it has finished"
   warn "  plugins list|poll|log            inspect plugins / force a poll now / show the plugin log"
   warn "  plugins install <git-url>        install a third-party plugin repo"
   warn "  show <file> [line|start-end]   show a file in a vim pane above this agent"

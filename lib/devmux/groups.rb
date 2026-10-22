@@ -18,7 +18,9 @@ module Devmux
     # Built-in groups always exist and can't be removed (rename/reorder are
     # fine). Keyed by kind; the value is the name used when creating it.
     CODE_REVIEWS = "code_reviews".freeze
-    BUILTIN = { CODE_REVIEWS => "Code Reviews" }.freeze
+    BACKGROUND_TASKS = "background_tasks".freeze
+    BUILTIN = { CODE_REVIEWS => "Code Reviews", BACKGROUND_TASKS => "Background Tasks" }.freeze
+    UNCONFIGURABLE = [BACKGROUND_TASKS].freeze
 
     def state_dir
       base = ENV["XDG_STATE_HOME"] || File.join(Dir.home, ".local", "state")
@@ -56,6 +58,10 @@ module Devmux
     def builtin_id(kind)
       group = all.find { |g| g[:builtin] == kind }
       group && group[:id]
+    end
+
+    def configurable
+      all.reject { |g| UNCONFIGURABLE.include?(g[:builtin]) }
     end
 
     def builtin?(id)

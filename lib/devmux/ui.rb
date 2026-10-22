@@ -199,6 +199,12 @@ module Devmux
       @groups || []
     end
 
+    def hidden_group_ids
+      (@groups || []).select do |g|
+        g[:builtin] == Groups::BACKGROUND_TASKS && (@agents || []).none? { |a| !a[:archived] && a[:group] == g[:id] }
+      end.map { |g| g[:id] }
+    end
+
     # Flatten agents into rows, bucketed by group: first the unnamed group (no
     # header) at the top, then each named group — a blank spacer, a header, and
     # its members — in group order (named groups show even when empty, so a
@@ -210,6 +216,7 @@ module Devmux
       rows = []
       active.select { |a| a[:group].nil? }.each { |a| rows.concat(agent_and_tree(a)) }
       (@groups || []).each do |group|
+        next if hidden_group_ids.include?(group[:id])
         rows << { type: :spacer } unless rows.empty?
         rows << { type: :group_header, group: group }
         next if @collapsed_groups.include?(group[:id]) # collapsed: hide members
@@ -269,7 +276,7 @@ module Devmux
       when "d"        then open_pr(path: "/changes")
       when "n"        then @backend.new_agent_pick
       when "p"        then open_pr
-      when "t"        then open_ticket
+      when "t"        then @backend.run_task_pick
       when "v"        then open_editor_selected
       when "c"        then open_console_selected(:worktree)
       when "C"        then open_console_selected(:main)
@@ -347,7 +354,7 @@ module Devmux
     def move_selected(delta)
       agent = selected_agent
       return unless agent
-      @backend.move_agent(agent[:name], delta, skip: @collapsed_groups.to_a)
+      @backend.move_agent(agent[:name], delta, skip: @collapsed_groups.to_a + hidden_group_ids)
       refresh
       idx = @rows.index { |r| r[:type] == :agent && r[:agent][:name] == agent[:name] }
       @sel = idx if idx
@@ -561,15 +568,6 @@ module Devmux
 
     def focus_active?
       (@agents || []).any? { |a| a[:focused] }
-    end
-
-    def open_ticket
-      a = selected_agent
-      return unless a
-      ticket = a[:resources]["tickets"].first
-      return unless ticket
-      @backend.open_resource(ticket[:id])
-      @backend.focus_agent(a[:name])
     end
 
     def delete_selected
@@ -1186,7 +1184,7 @@ module Devmux
     # Key hints for the expanded section, one per line, filtered to what the
     # hovered row actually supports (as the old footer did) but with the reorder /
     # group-jump actions spelled out. [↵] is open on a resource row, tree/toggle
-    # on an agent; [p]/[t] only with a PR/ticket; the group-jump line only when
+    # on an agent; [p]/[d] only with a single PR; the group-jump line only when
     # groups exist. (Worktree bind now lives in the [m] actions menu.)
     def hint_items
       row = @rows[@sel]
@@ -1207,13 +1205,12 @@ module Devmux
         items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
         items << "[m] actions"
         items << "[p] PR" << "[d] PR diff" if a[:resources]["prs"].size == 1
-        items << "[t] ticket" unless a[:resources]["tickets"].empty?
         items << "[↵] tree" unless resource_list(a).empty?
         items << "[⌫] delete"
       else
         items << "[↵] toggle"
       end
-      items << "[n] new" << "[z] settings"
+      items << "[n] new" << "[t] run task" << "[z] settings"
       if focus_active?
         items << "[f] exit focus"
       elsif row && row[:type] == :agent
