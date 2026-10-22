@@ -104,37 +104,50 @@ module Devmux
       nil
     end
 
-    # Focus an existing Chrome tab whose URL starts with `url` (covers PR
-    # sub-pages like /files). Returns true if a matching tab was focused.
-    # The URL is passed as an argv argument to avoid AppleScript string escaping.
+    # Focus an existing tab in the main Chrome whose URL starts with `url` (covers
+    # PR sub-pages like /files). Returns true if a matching tab was focused.
+    # The URL is passed as an argv argument to avoid script string escaping.
     def focus_chrome_tab(url)
-      system("osascript", "-e", CHROME_FOCUS_SCRIPT, url,
+      pid = main_chrome_pid
+      return false unless pid
+      system("osascript", "-l", "JavaScript", "-e", CHROME_FOCUS_SCRIPT, pid.to_s, url,
              out: File::NULL, err: File::NULL)
     rescue StandardError
       false
     end
 
-    CHROME_FOCUS_SCRIPT = <<~'APPLESCRIPT'.freeze
-      on run argv
-        set target to item 1 of argv
-        tell application "Google Chrome"
-          repeat with w in windows
-            set i to 0
-            repeat with t in tabs of w
-              set i to i + 1
-              set u to URL of t
-              if (u is target) or (u starts with (target & "/")) or (u starts with (target & "?")) or (u starts with (target & "#")) then
-                set active tab index of w to i
-                set index of w to 1
-                activate
-                return
-              end if
-            end repeat
-          end repeat
-        end tell
-        error "no matching tab" number 1
-      end run
-    APPLESCRIPT
+    def main_chrome_pid
+      out, _status = Open3.capture2("ps", "-axo", "pid=,command=")
+      line = out.lines.find do |l|
+        l.include?(CHROME_BINARY) && !l.include?("--type=") && !l.include?("--user-data-dir")
+      end
+      line && line.strip.split(" ", 2).first.to_i
+    rescue StandardError
+      nil
+    end
+
+    CHROME_FOCUS_SCRIPT = <<~'JXA'.freeze
+      ObjC.import("ScriptingBridge")
+      function run(argv) {
+        const app = $.SBApplication.applicationWithProcessIdentifier(parseInt(argv[0]))
+        const target = argv[1]
+        const windows = app.valueForKey("windows")
+        for (let w = 0; w < windows.count; w++) {
+          const win = windows.objectAtIndex(w)
+          const tabs = win.valueForKey("tabs")
+          for (let t = 0; t < tabs.count; t++) {
+            const u = String(ObjC.unwrap(tabs.objectAtIndex(t).valueForKey("URL")))
+            if (u === target || ["/", "?", "#"].some(sep => u.startsWith(target + sep))) {
+              win.setValueForKey(t + 1, "activeTabIndex")
+              win.setValueForKey(1, "index")
+              Application("System Events").processes.whose({ unixId: parseInt(argv[0]) })[0].frontmost = true
+              return
+            }
+          }
+        }
+        throw new Error("no matching tab")
+      }
+    JXA
 
     CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".freeze
 
