@@ -69,6 +69,7 @@ module Devmux
       @published_hover = nil # sentinel so the first publish_hover always applies
       @published_width = nil # sentinel so the first publish_width always applies
       @expanded = Set.new   # session names shown as a resource tree
+      @pr_counts = {}
       @rename_buf = nil     # non-nil while the rename prompt is active
       @hints_expanded = false # key hints hidden until toggled with "?"
       @collapsed_groups = Set.new # group ids whose members are hidden
@@ -175,8 +176,17 @@ module Devmux
     def refresh
       @agents = safe_agents
       @groups = safe_groups
+      auto_expand_multi_pr
       @rows = build_rows(@agents)
       clamp_selection
+    end
+
+    def auto_expand_multi_pr
+      @agents.each do |a|
+        count = Array((a[:resources] || {})["prs"]).size
+        @expanded.add(a[:name]) if count >= 2 && count > @pr_counts.fetch(a[:name], 0)
+        @pr_counts[a[:name]] = count
+      end
     end
 
     def safe_groups
