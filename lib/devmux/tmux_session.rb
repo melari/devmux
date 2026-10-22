@@ -95,6 +95,7 @@ module Devmux
       return if url.empty?
       if RUBY_PLATFORM.include?("darwin")
         return if focus_chrome_tab(url)
+        return if open_in_main_chrome(url)
         system("open", url, out: File::NULL, err: File::NULL)
       else
         system("xdg-open", url, out: File::NULL, err: File::NULL)
@@ -104,8 +105,7 @@ module Devmux
     end
 
     # Focus an existing Chrome tab whose URL starts with `url` (covers PR
-    # sub-pages like /files), else open it in a new tab / window. Returns true if
-    # Chrome handled it, false if Chrome isn't available (so we can fall back).
+    # sub-pages like /files). Returns true if a matching tab was focused.
     # The URL is passed as an argv argument to avoid AppleScript string escaping.
     def focus_chrome_tab(url)
       system("osascript", "-e", CHROME_FOCUS_SCRIPT, url,
@@ -131,16 +131,22 @@ module Devmux
               end if
             end repeat
           end repeat
-          if (count of windows) is 0 then
-            make new window
-            set URL of active tab of front window to target
-          else
-            tell front window to make new tab with properties {URL:target}
-          end if
-          activate
         end tell
+        error "no matching tab" number 1
       end run
     APPLESCRIPT
+
+    CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".freeze
+
+    def open_in_main_chrome(url)
+      return false unless File.executable?(CHROME_BINARY)
+      pid = Process.spawn(CHROME_BINARY, url, in: File::NULL, out: File::NULL,
+                          err: File::NULL, pgroup: true)
+      Process.detach(pid)
+      true
+    rescue StandardError
+      false
+    end
 
     # The user-facing name: the context "name" if set, otherwise the slug.
     def display_name(record)
