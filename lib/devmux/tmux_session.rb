@@ -1319,7 +1319,8 @@ module Devmux
     # caching state (plugin store), or the bind enforcer flipping ok/broken.
     def state_mtime
       files = [@state_file, @bind_file, @bg_file, Devmux::Worktrees.store_path,
-               File.join(TmuxSession.state_dir, "groups.json")] +
+               File.join(TmuxSession.state_dir, "groups.json"),
+               File.join(TmuxSession.state_dir, "sidebar.json")] +
               Dir.glob(File.join(TmuxSession.state_dir, "plugin-*.json")) +
               Dir.glob(File.join(TmuxSession.state_dir, "show-*.json"))
       files.map { |f| File.mtime(f) rescue nil }.compact.max

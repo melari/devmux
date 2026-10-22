@@ -2,6 +2,7 @@ require "io/console"
 require "devmux/plugins"
 require "devmux/groups"
 require "devmux/icons"
+require "devmux/sidebar_resources"
 
 module Devmux
   # The settings popover: a small modal TUI launched in a centered tmux popup
@@ -10,12 +11,13 @@ module Devmux
   #
   #   Plugins — toggle each devmux plugin on/off (was the standalone plugins menu).
   #   Groups  — create / rename / remove the named sidebar groups.
+  #   Resources — choose which resource kinds (branches, tickets, PRs, …) the sidebar shows.
   #
   # It runs as its own process, so it just reads and writes the shared Plugins /
   # Groups stores; the manager UI re-renders when it regains control after the
   # popup closes. Esc backs out of a category to the root, then closes the popup.
   class SettingsMenu
-    CATEGORIES = %w[Groups Plugins].freeze
+    CATEGORIES = %w[Groups Plugins Resources].freeze
 
     def initialize
       @view = :root
@@ -42,6 +44,7 @@ module Devmux
       when :root    then root_key(key)
       when :plugins then plugins_key(key)
       when :groups  then groups_key(key)
+      when :resources then resources_key(key)
       end
     end
 
@@ -56,8 +59,19 @@ module Devmux
     end
 
     def open_category
-      @view = CATEGORIES[@sel] == "Plugins" ? :plugins : :groups
+      @view = CATEGORIES[@sel].downcase.to_sym
       @sel = 0
+    end
+
+    def resources_key(key)
+      kinds = SidebarResources.kinds
+      case key
+      when "j", :down then move(1, kinds.size)
+      when "k", :up   then move(-1, kinds.size)
+      when "\r", "\n", " " then SidebarResources.toggle(kinds[@sel]) if kinds[@sel]
+      when "\e", "q" then back_to_root
+      end
+      true
     end
 
     def plugins_key(key)
@@ -133,6 +147,7 @@ module Devmux
       when :root    then render_root
       when :plugins then render_plugins
       when :groups  then render_groups
+      when :resources then render_resources
       end
     end
 
@@ -163,6 +178,22 @@ module Devmux
       box = on ? Icons::CHECK_ON : Icons::CHECK_OFF
       logo = plugin.logo && Icons.nerd? ? "#{plugin.logo} " : ""
       text = "#{cursor}#{box} #{logo}#{plugin.name}"
+      on ? text : dim(text)
+    end
+
+    def render_resources
+      lines = ["settings › resources", ""]
+      SidebarResources.kinds.each_with_index { |kind, i| lines << resource_row(kind, i == @sel) }
+      lines << ""
+      lines << dim("[j/k] move   [↵] toggle   [esc] back")
+      draw(lines)
+    end
+
+    def resource_row(kind, selected)
+      cursor = selected ? "#{Icons.selector} " : "  "
+      on = SidebarResources.shown?(kind)
+      box = on ? Icons::CHECK_ON : Icons::CHECK_OFF
+      text = "#{cursor}#{box} #{SidebarResources.label(kind)}"
       on ? text : dim(text)
     end
 

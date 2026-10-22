@@ -2,6 +2,7 @@ require "io/console"
 require "set"
 require "devmux/tmux_session"
 require "devmux/icons"
+require "devmux/sidebar_resources"
 
 module Devmux
   # The devmux control-plane pane: the sidebar the multiplexer runs on launch.
@@ -70,6 +71,7 @@ module Devmux
       @published_width = nil # sentinel so the first publish_width always applies
       @expanded = Set.new   # session names shown as a resource tree
       @pr_counts = {}
+      @hidden_resources = []
       @rename_buf = nil     # non-nil while the rename prompt is active
       @hints_expanded = false # key hints hidden until toggled with "?"
       @collapsed_groups = Set.new # group ids whose members are hidden
@@ -176,6 +178,7 @@ module Devmux
     def refresh
       @agents = safe_agents
       @groups = safe_groups
+      @hidden_resources = SidebarResources.hidden
       auto_expand_multi_pr
       @rows = build_rows(@agents)
       clamp_selection
@@ -233,7 +236,7 @@ module Devmux
         children = []
         # First child: the worktree's branch name (fetched lazily, only for the
         # expanded session). Enter on it copies the branch to the clipboard.
-        branch = @backend.worktree_branch(agent[:name])
+        branch = @hidden_resources.include?("branch") ? nil : @backend.worktree_branch(agent[:name])
         children << { type: :branch, agent: agent, branch: branch } if branch && !branch.empty?
         resource_list(agent).each { |res| children << { type: :resource, agent: agent, resource: res } }
         children.each_with_index do |row, i|
@@ -735,7 +738,7 @@ module Devmux
     # All resource views for an agent (tickets, prs, and any plugin keys like
     # slack_threads) flattened in display order.
     def resource_list(agent)
-      (agent[:resources] || {}).values.flatten
+      (agent[:resources] || {}).reject { |kind, _| @hidden_resources.include?(kind) }.values.flatten
     end
 
     # A single association glyph, colored per mode: full color when :normal, the
@@ -1053,7 +1056,7 @@ module Devmux
     def chevron(agent)
       # Expandable when it has resources OR a worktree (whose branch is the tree's
       # first row), so a worktree-only session still shows the disclosure arrow.
-      return "  " if resource_list(agent).empty? && !agent[:has_worktree]
+      return "  " if resource_list(agent).empty? && !(agent[:has_worktree] && !@hidden_resources.include?("branch"))
       @expanded.include?(agent[:name]) ? "▾ " : "▸ "
     end
 
