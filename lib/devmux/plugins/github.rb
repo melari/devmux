@@ -1,6 +1,7 @@
 require "json"
 require "open3"
 require "devmux/plugin_store"
+require "devmux/groups"
 
 module Devmux
   module Plugins
@@ -146,7 +147,8 @@ module Devmux
         data = @store.read
         data["resources"] ||= {}
         attached.each { |id, pr| data["resources"][id] = store_rec(pr) }
-        notify_ready(data, attached)
+        own = host.sessions.reject { |s| s[:archived] || s[:builtin_group] == Groups::CODE_REVIEWS }.flat_map { |s| s[:prs] }
+        notify_ready(data, attached.select { |id, _| own.include?(id) })
         @store.write(data)
       end
 

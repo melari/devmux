@@ -1,10 +1,12 @@
+require "devmux/groups"
+
 module Devmux
   # The slice of devmux a plugin's `poll` is handed. It deliberately hides the
   # registry internals behind a small, stable API so a third-party plugin only
   # depends on this surface:
   #
   #   host.sessions
-  #     -> [{ name:, prs: [ids], tickets: [ids], worktree:, context:,
+  #     -> [{ name:, prs: [ids], tickets: [ids], builtin_group:, archived:, worktree:, context:,
   #           background: [{plugin_id:, action_id:}] }, ...] for every session, so
   #        the plugin can tell which resources are attached, refresh their state,
   #        compare against local (worktree/context), and see which of its own
@@ -30,9 +32,11 @@ module Devmux
     end
 
     def sessions
+      builtin = Groups.all.each_with_object({}) { |g, h| h[g[:id]] = g[:builtin] if g[:builtin] }
       @registry.agents.map do |a|
         ctx = a["context"] || {}
         { name: a["name"], prs: Array(ctx["prs"]), tickets: Array(ctx["tickets"]),
+          builtin_group: builtin[a["group"].to_s], archived: !!a["archived"],
           worktree: ctx["worktree"], context: ctx,
           background: @running.select { |r| r[:uuid] == a["uuid"] }
                               .map { |r| { plugin_id: r[:plugin_id], action_id: r[:action_id] } } }

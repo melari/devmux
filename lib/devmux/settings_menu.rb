@@ -119,7 +119,7 @@ module Devmux
 
     def delete_group
       group = Groups.all[@sel]
-      Groups.remove(group[:id]) if group
+      Groups.remove(group[:id]) if group && !group[:builtin]
       @sel = [@sel, [Groups.all.size - 1, 0].max].min
     end
 
@@ -213,6 +213,7 @@ module Devmux
     def group_row(group, selected)
       cursor = selected ? "#{Icons.selector} " : "  "
       text = "#{cursor}#{group[:name]}"
+      text += dim(" (built-in)") if group[:builtin]
       selected ? text : dim(text)
     end
 
