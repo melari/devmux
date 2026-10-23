@@ -178,6 +178,7 @@ module Devmux
     # which must not shell out) and recompute the row layout.
     def refresh
       @agents = safe_agents
+      @agents = safe_agents if leave_stale_focus
       @groups = safe_groups
       @hidden_resources = SidebarResources.hidden
       auto_expand_multi_pr
@@ -191,6 +192,15 @@ module Devmux
         @expanded.add(a[:name]) if count >= 2 && count > @pr_counts.fetch(a[:name], 0)
         @pr_counts[a[:name]] = count
       end
+    end
+
+    def leave_stale_focus
+      name = @backend.focused_session
+      return false if name.nil? || @agents.any? { |a| a[:name] == name && !a[:archived] }
+      @backend.exit_focus
+      true
+    rescue StandardError
+      false
     end
 
     def safe_groups
@@ -1037,9 +1047,12 @@ module Devmux
     def group_title(group)
       collapsed = @collapsed_groups.include?(group[:id])
       arrow = collapsed ? "▸" : "▾"
-      sgr = collapsed ? "2;38;5;39" : "1;38;5;39" # dim vs bold aqua
+      color = GROUP_COLORS.fetch(group[:builtin], "38;5;39")
+      sgr = collapsed ? "2;#{color}" : "1;#{color}" # dim vs bold
       "\e[#{sgr}m#{arrow} #{truncate(group[:name].to_s, cols - 3)}\e[0m"
     end
+
+    GROUP_COLORS = { Groups::CODE_REVIEWS => "38;5;220" }.freeze
 
     # Progressive-disclosure chevron for a session, in a fixed 2-cell slot so
     # rows stay aligned: ▾ when its resource tree is expanded, ▸ when collapsed
