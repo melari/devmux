@@ -215,6 +215,10 @@ module Devmux
       run("kill-session", "-t", @session)
     end
 
+    def self.kill_server
+      system("tmux", "-L", SOCKET, "kill-server", out: File::NULL, err: File::NULL)
+    end
+
     # Show a centered floating popup running `command`, closing it when the
     # command exits (-E). Blocks until it closes. Used for the plugins menu, which
     # should float over the whole window rather than live in the narrow drawer.

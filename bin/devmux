@@ -313,6 +313,12 @@ when "sessions"
   when "archive" then sessions_archive(ARGV.shift || die("usage: devmux sessions archive <session_id>"))
   else die "usage: devmux sessions list|new|archive ..."
   end
+when "kill"
+  if Devmux::Tmux.kill_server
+    puts "killed the devmux tmux server"
+  else
+    die "no devmux tmux server running"
+  end
 when "open"
   # Open a resource identifier's URL in the browser (used by click-to-open and
   # available from a shell).
@@ -347,6 +353,7 @@ else
   warn "usage: devmux [--status-bar] [command]"
   warn "  (no command)  launch devmux (hidden tmux session)"
   warn "  --status-bar  show tmux's status bar (default: hidden)"
+  warn "  kill          kill the devmux tmux server (hard restart; running agents are killed)"
   warn "  ui            run the control-plane UI (used inside the session)"
   warn "  tmux-toggle   toggle the manager drawer (used by the Ctrl-Space bind)"
   warn "  settings-menu   the settings menu: plugins + groups (used inside the manager's popup)"
