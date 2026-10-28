@@ -1299,6 +1299,7 @@ module Devmux
     # = 4), so Ctrl is held when (mod - 1) & 4 is set. Ctrl-u (code 117) and Ctrl-d
     # (code 100) become bytes 0x15 / 0x04.
     def extended_key(code, mod)
+      return code.chr(Encoding::UTF_8) if ((mod - 1) & ~1).zero? && code >= 0x20 && code != 127
       ctrl = ((mod - 1) & 4) != 0
       return "\e" unless ctrl
       case code
