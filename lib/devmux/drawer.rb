@@ -35,6 +35,7 @@ module Devmux
       panes = tmux.panes
       manager = panes.find { |p| p[:title] == MANAGER_TITLE }
       return unless manager
+      return if panes.all? { |p| p[:id] == manager[:id] }
 
       if manager[:width] <= (COLLAPSED_WIDTH + MIN_EXPANDED_WIDTH) / 2
         active = panes.find { |p| p[:active] }
