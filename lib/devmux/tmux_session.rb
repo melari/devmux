@@ -1902,15 +1902,12 @@ module Devmux
 
     private
 
-    # On a fresh registry, create agent-1. On a restarted session with active
-    # agents but nothing shown yet, resume the first active one so the user lands
-    # on something rather than an empty screen (archived agents stay put). Either
-    # way we focus the agent (collapsing the drawer) so it's immediately usable.
+    # On a fresh registry, create agent-1 and focus it (collapsing the drawer) so
+    # it's immediately usable. On a restarted session with existing agents, show
+    # nothing and leave the user in the sidebar to choose.
     def ensure_initial_agent
-      return unless shown_panes.empty?
-      active = @registry.agents.reject { |a| a["archived"] }
-      record = active.first || @registry.add
-      show_pane(record, focus_new: true)
+      return unless shown_panes.empty? && @registry.agents.empty?
+      show_pane(@registry.add, focus_new: true)
     end
 
     # Show a pane for a registry record: rejoin its hidden pane if it has one,
