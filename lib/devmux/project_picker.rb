@@ -42,6 +42,7 @@ module Devmux
           when :down then move(1)
           when :up   then move(-1)
           when "\r", "\n" then (choose; break)
+          when "\t" then (choose(kind: "vim"); break)
           when "\e", "\u0003", "\u0004" then break # Esc / Ctrl-c / EOF
           when "\u007f", "\b" then backspace
           when String then type(key)
@@ -84,11 +85,11 @@ module Devmux
     # when nothing matches — the typed filter if it expands to a real directory
     # (so you can jump to a repo the scan didn't surface). No file written on an
     # empty choice, so the manager treats it as a cancel.
-    def choose
+    def choose(kind: nil)
       path = filtered[@sel] || manual_path
       return unless path
       FileUtils.mkdir_p(File.dirname(Projects.picked_path))
-      File.write(Projects.picked_path, JSON.generate("path" => path))
+      File.write(Projects.picked_path, JSON.generate({ "path" => path, "kind" => kind }.compact))
     rescue StandardError
       nil
     end
@@ -102,14 +103,14 @@ module Devmux
     def render
       list = filtered
       @sel = @sel.clamp(0, [list.size - 1, 0].max)
-      lines = ["new agent in project", "", filter_line, ""]
+      lines = ["new session in project", "", filter_line, ""]
       if list.empty?
         lines << dim(manual_path ? "↵ use #{tilde(manual_path)}" : "  (no matches)")
       else
         window(list).each { |i| lines << row(list[i], i == @sel) }
       end
       lines << ""
-      lines << dim("[type] filter   [j/k] move   [enter] pick   [esc] cancel")
+      lines << dim("[type] filter  [↑/↓] move  [enter] agent  [tab] vim  [esc] cancel")
       draw(lines)
     end
 

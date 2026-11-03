@@ -16,6 +16,8 @@ module Devmux
     NERD_SELECTOR = "\u{f0a03}".freeze # md- arrow, used as the selection cursor
     NERD_LOGO     = "\u{f44f}".freeze  # glyph shown before the devmux title
     PLAIN_AGENT   = "✦".freeze
+    NERD_VIM      = "\u{e62b}".freeze
+    PLAIN_VIM     = "v".freeze
 
     # Checkbox glyphs (not Nerd Font — always available). Shared by the sidebar
     # (pane open/closed) and the plugins menu (plugin on/off) so they look alike.
@@ -49,6 +51,10 @@ module Devmux
       override = ENV["DEVMUX_ICON_AGENT"]
       return override if override && !override.empty?
       nerd? ? NERD_AGENT : PLAIN_AGENT
+    end
+
+    def vim
+      nerd? ? NERD_VIM : PLAIN_VIM
     end
 
     def ticket

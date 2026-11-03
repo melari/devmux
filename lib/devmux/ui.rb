@@ -795,7 +795,7 @@ module Devmux
         elsif agent[:state] == "busy" then "38;5;208" # active — orange
         else "38;5;250"                           # idle — grey
         end
-      "\e[#{sgr}m#{Icons.agent}\e[0m"
+      "\e[#{sgr}m#{agent[:vim] ? Icons.vim : Icons.agent}\e[0m"
     end
 
     # Keep the cursor in range AND on a selectable row (never on a group header

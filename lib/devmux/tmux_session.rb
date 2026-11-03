@@ -786,7 +786,7 @@ module Devmux
         { name: a["name"], display: TmuxSession.display_label(a),
           display_plain: TmuxSession.display_label(a, brackets: false), state: agent_state(a),
           resources: resource_map(ctx),
-          shown: shown.key?(a["name"]), archived: !!a["archived"],
+          shown: shown.key?(a["name"]), archived: !!a["archived"], vim: a["kind"] == "vim",
           focused: a["name"] == focused,
           # Membership: the group id, or nil for the implicit unnamed group (also
           # nil when the id points at a since-deleted group).
@@ -832,8 +832,8 @@ module Devmux
     # Create a brand-new agent (fresh Claude session) and drop into it — you make
     # a new agent to start working in it, so collapse the drawer and focus it.
     # `project` (optional) is the directory it runs in; nil uses the default.
-    def new_agent(project: nil)
-      show_pane(@registry.add(project: project), focus_new: true)
+    def new_agent(project: nil, kind: nil)
+      show_pane(@registry.add(project: project, kind: kind), focus_new: true)
     end
 
     # Pick a project in a centered popup, then create a new agent there. The
@@ -847,8 +847,8 @@ module Devmux
       @tmux.display_popup("#{bin.shellescape} project-picker",
                           width: 64, height: 22, border: "heavy",
                           border_style: "fg=colour208")
-      project = take_picked_project
-      new_agent(project: project) if project
+      project, kind = take_picked_project
+      new_agent(project: project, kind: kind) if project
     rescue StandardError => e
       TmuxSession.log_error("project-pick", e)
     end
@@ -930,7 +930,8 @@ module Devmux
       data = JSON.parse(File.read(path)) rescue nil
       File.delete(path) rescue nil
       dir = data && data["path"].to_s
-      dir if dir && !dir.empty? && File.directory?(dir)
+      return nil unless dir && !dir.empty? && File.directory?(dir)
+      [dir, data["kind"] == "vim" ? "vim" : nil]
     end
 
     # Enter on an agent row: hide the pane (moved to the hidden session, so the
@@ -1923,10 +1924,15 @@ module Devmux
       env = { "DEVMUX_SESSION" => record["uuid"] }
       env["DEVMUX_BIN"] = @exe if @exe
       id = @tmux.split_right(target: rightmost_pane, cwd: agent_cwd(record),
-                             command: TmuxSession.agent_command(record["uuid"], exe: @exe),
+                             command: pane_command(record),
                              name: name, env: env)
       tag_pane(id, record)
       place_pane(id, focus_new)
+    end
+
+    def pane_command(record)
+      return editor if record["kind"] == "vim"
+      TmuxSession.agent_command(record["uuid"], exe: @exe)
     end
 
     def tag_pane(id, record)
