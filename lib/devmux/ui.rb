@@ -59,9 +59,12 @@ module Devmux
     # glyph+space = 2 cells, so icon index = (col - ICON_START_COL) / 2.
     ICON_START_COL = 9
 
+    SCROLL_MARGIN = 10
+
     def initialize(backend)
       @backend = backend
       @sel = 0
+      @scroll = 0
       @archive_expanded = false
       @reveal = REVEAL_STEP
       @confirm = nil
@@ -306,7 +309,9 @@ module Devmux
       return unless event[:press] && event[:button].zero?
       @backend.focus_manager
       return if cols <= COMPACT_MAX_COLS
-      row_index = event[:y] - HINT_HEIGHT - 1
+      list_line = event[:y] - HINT_HEIGHT - 1
+      return unless (0...list_height).cover?(list_line)
+      row_index = list_line + @scroll
       return unless (0...@rows.size).cover?(row_index)
       row = @rows[row_index]
       return unless selectable?(row) # ignore clicks on group headers / spacers
@@ -932,9 +937,23 @@ module Devmux
       if @rows.empty?
         $stdout.write("  (no agents)\r\n")
       else
-        @rows.each_with_index { |row, i| $stdout.write(render_row(row, i == @sel)) }
+        adjust_scroll
+        @rows.each_with_index.drop(@scroll).first(list_height).each do |row, i|
+          $stdout.write(render_row(row, i == @sel))
+        end
       end
       draw_bottom
+    end
+
+    def list_height
+      [rows - HINT_HEIGHT - bottom_block.size - 1, 1].max
+    end
+
+    def adjust_scroll
+      height = list_height
+      margin = [SCROLL_MARGIN, (height - 1) / 2].min
+      @scroll = @scroll.clamp(@sel + margin - height + 1, @sel - margin)
+      @scroll = @scroll.clamp(0, [@rows.size - height, 0].max)
     end
 
     # The bottom section, pinned to the last rows of the pane via absolute cursor
@@ -943,6 +962,17 @@ module Devmux
     # section (a single "[?] help" line collapsed, the full vertical list on a gray
     # background when expanded). Any error is appended as the very last line.
     def draw_bottom
+      block = bottom_block
+      return if block.empty?
+      start = [rows - block.size + 1, 1].max
+      $stdout.write("\e[#{start};1H")
+      block.each_with_index do |line, i|
+        $stdout.write(line)
+        $stdout.write("\r\n") unless i == block.size - 1
+      end
+    end
+
+    def bottom_block
       block =
         if @actions_menu
           actions_menu_block
@@ -956,13 +986,7 @@ module Devmux
           hint_block
         end
       block += ["  \e[38;5;196m! #{@last_error}\e[0m"] if @last_error
-      return if block.empty?
-      start = [rows - block.size + 1, 1].max
-      $stdout.write("\e[#{start};1H")
-      block.each_with_index do |line, i|
-        $stdout.write(line)
-        $stdout.write("\r\n") unless i == block.size - 1
-      end
+      block
     end
 
     # The actions-menu block (gray footer panel): a title, one line per action with
