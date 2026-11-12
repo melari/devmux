@@ -55,7 +55,8 @@ module Devmux
 
       PR_FIELDS =
         "title state isDraft mergeable url " \
-        "latestOpinionatedReviews(first: 100) { nodes { state } } " \
+        "latestOpinionatedReviews(first: 100) { nodes { state author { login } } } " \
+        "reviewRequests(first: 100) { nodes { requestedReviewer { ... on User { login } } } } " \
         "mergeQueueEntry { estimatedTimeToMerge } " \
         "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
 
@@ -306,7 +307,10 @@ module Devmux
       end
 
       def approval_count(node)
-        Array(node.dig("latestOpinionatedReviews", "nodes")).count { |r| r["state"] == "APPROVED" }
+        rerequested = Array(node.dig("reviewRequests", "nodes")).filter_map { |r| r.dig("requestedReviewer", "login") }
+        Array(node.dig("latestOpinionatedReviews", "nodes")).count do |r|
+          r["state"] == "APPROVED" && !rerequested.include?(r.dig("author", "login"))
+        end
       end
 
       def pr_identifier(url)
