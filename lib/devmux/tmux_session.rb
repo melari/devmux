@@ -1023,7 +1023,9 @@ module Devmux
       return unless state
       @tmux.set_option(FOCUS_OPTION, "")
       restore = Array(state["restore"])
-      shown_panes.each { |name, pane| hide_agent(name, pane) unless restore.include?(name) }
+      shown = shown_panes
+      keep = shown.keys.zip(restore).take_while { |current, wanted| current == wanted }.map(&:first)
+      shown.each { |name, pane| hide_agent(name, pane) unless keep.include?(name) }
       restore.each do |name|
         record = @registry.record(name)
         show_pane(record) if record && !record["archived"] && !shown_panes.key?(name)
