@@ -289,6 +289,7 @@ module Devmux
       when "d"        then open_pr(path: "/changes")
       when "n"        then @backend.new_agent_pick
       when "p"        then open_pr
+      when "P"        then open_pr(layout: false)
       when "t"        then @backend.run_task_pick
       when "v"        then open_editor_selected
       when "c"        then open_console_selected(:worktree)
@@ -507,7 +508,7 @@ module Devmux
     # Open the selected session's first associated pull request in the browser,
     # then return focus to its agent pane (if open) so the terminal is on the
     # agent when you come back.
-    def open_pr(path: nil)
+    def open_pr(path: nil, layout: true)
       row = @rows[@sel]
       return unless row && %i[agent resource].include?(row[:type])
       a = row[:agent]
@@ -521,7 +522,8 @@ module Devmux
           prs.first
         end
       return unless pr
-      @backend.open_resource(pr[:id], a[:name], path: path)
+      @backend.open_resource(pr[:id], a[:name], path: path, layout: layout)
+      return unless layout
       @backend.focus_agent(a[:name])
     end
 
@@ -1232,7 +1234,7 @@ module Devmux
         items << "[↵] copy branch"
       when :resource
         items << "[↵] open"
-        items << "[p] PR" << "[d] PR diff" if row[:agent][:resources]["prs"].any? { |pr| pr[:id] == row[:resource][:id] }
+        items << "[p/P] PR" << "[d] PR diff" if row[:agent][:resources]["prs"].any? { |pr| pr[:id] == row[:resource][:id] }
       when :group_header
         items << (@collapsed_groups.include?(row[:group][:id]) ? "[↵] expand group" : "[↵] collapse group")
       when :agent
@@ -1241,7 +1243,7 @@ module Devmux
         items << "[a] archive" unless a[:archived]
         items << "[v] vim" << "[c] console" << "[C] main console" if a[:shown]
         items << "[m] actions"
-        items << "[p] PR" << "[d] PR diff" if a[:resources]["prs"].size == 1
+        items << "[p/P] PR" << "[d] PR diff" if a[:resources]["prs"].size == 1
         items << "[↵] tree" unless resource_list(a).empty?
         items << "[⌫] delete"
       else

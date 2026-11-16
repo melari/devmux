@@ -1370,10 +1370,11 @@ module Devmux
 
     # Open the browser URL for a resource id (a clicked ticket/PR icon), via the
     # owning plugin. No-op if the plugin can't resolve a URL.
-    def open_resource(identifier, name = nil, path: nil)
+    def open_resource(identifier, name = nil, path: nil, layout: true)
       url = Plugins.resource_url(identifier)
       return unless url
       TmuxSession.open_url(path ? "#{url}#{path}" : url, match: url)
+      return unless layout
       owner = pr_owner(identifier, name)
       return unless owner
       split_layout
